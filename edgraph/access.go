@@ -21,7 +21,7 @@ package edgraph
 import (
 	"context"
 
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v2/y"
 	"github.com/dgraph-io/dgo/v2/protos/api"
 	"github.com/dgraph-io/dgraph/gql"
 	"github.com/dgraph-io/dgraph/x"
@@ -61,6 +61,11 @@ func authorizeMutation(ctx context.Context, gmu *gql.Mutation) error {
 }
 
 func authorizeQuery(ctx context.Context, parsedReq *gql.Result) error {
+	// always allow access
+	return nil
+}
+
+func authorizeState(ctx context.Context) error {
 	// always allow access
 	return nil
 }
