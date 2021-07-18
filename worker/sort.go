@@ -17,24 +17,24 @@
 package worker
 
 import (
+	"context"
 	"encoding/hex"
-	"sort"
 	"strings"
 	"time"
 
-	"github.com/dgraph-io/badger/v2"
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	otrace "go.opencensus.io/trace"
-	"golang.org/x/net/context"
 
-	"github.com/dgraph-io/dgraph/algo"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/tok"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/dgraph-io/sroar"
 )
 
 var emptySortResult pb.SortResult
@@ -54,15 +54,17 @@ type sortresult struct {
 
 // SortOverNetwork sends sort query over the network.
 func SortOverNetwork(ctx context.Context, q *pb.SortMessage) (*pb.SortResult, error) {
-	gid, err := groups().BelongsToReadOnly(q.Order[0].Attr)
+	gid, err := groups().BelongsToReadOnly(q.Order[0].Attr, q.ReadTs)
 	if err != nil {
 		return &emptySortResult, err
 	} else if gid == 0 {
-		return &emptySortResult, errors.Errorf("Cannot sort by unknown attribute %s", q.Order[0].Attr)
+		return &emptySortResult,
+			errors.Errorf("Cannot sort by unknown attribute %s", x.ParseAttr(q.Order[0].Attr))
 	}
 
 	if span := otrace.FromContext(ctx); span != nil {
-		span.Annotatef(nil, "worker.SortOverNetwork. Attr: %s. Group: %d", q.Order[0].Attr, gid)
+		span.Annotatef(nil, "worker.SortOverNetwork. Attr: %s. Group: %d",
+			x.ParseAttr(q.Order[0].Attr), gid)
 	}
 
 	if groups().ServesGroup(gid) {
@@ -88,7 +90,7 @@ func (w *grpcWorker) Sort(ctx context.Context, s *pb.SortMessage) (*pb.SortResul
 	ctx, span := otrace.StartSpan(ctx, "worker.Sort")
 	defer span.End()
 
-	gid, err := groups().BelongsToReadOnly(s.Order[0].Attr)
+	gid, err := groups().BelongsToReadOnly(s.Order[0].Attr, s.ReadTs)
 	if err != nil {
 		return &emptySortResult, err
 	}
@@ -146,7 +148,7 @@ func sortWithoutIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 			return resultWithError(ctx.Err())
 		default:
 			// Copy, otherwise it'd affect the destUids and hence the srcUids of Next level.
-			tempList := &pb.List{Uids: ts.UidMatrix[i].Uids}
+			tempList := &pb.List{SortedUids: codec.GetUids(ts.UidMatrix[i])}
 			var vals []types.Val
 			if vals, err = sortByValue(ctx, ts, tempList, sType); err != nil {
 				return resultWithError(err)
@@ -165,7 +167,7 @@ func sortWithoutIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 				}
 				multiSortOffsets = append(multiSortOffsets, offset)
 			}
-			tempList.Uids = tempList.Uids[start:end]
+			tempList.SortedUids = tempList.SortedUids[start:end]
 			vals = vals[start:end]
 			r.UidMatrix = append(r.UidMatrix, tempList)
 			multiSortVals[i] = vals
@@ -175,6 +177,10 @@ func sortWithoutIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 }
 
 func sortWithIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
+	if ctx.Err() != nil {
+		return resultWithError(ctx.Err())
+	}
+
 	span := otrace.FromContext(ctx)
 	span.Annotate(nil, "sortWithIndex")
 
@@ -185,8 +191,8 @@ func sortWithIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 		// offsets[i] is the offset for i-th posting list. It gets decremented as we
 		// iterate over buckets.
 		out[i].offset = int(ts.Offset)
-		var emptyList pb.List
-		out[i].ulist = &emptyList
+		out[i].ulist = &pb.List{}
+		out[i].skippedUids = &pb.List{}
 		out[i].uset = map[uint64]struct{}{}
 	}
 
@@ -197,11 +203,11 @@ func sortWithIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 	}
 
 	// Get the tokenizers and choose the corresponding one.
-	if !schema.State().IsIndexed(order.Attr) {
+	if !schema.State().IsIndexed(ctx, order.Attr) {
 		return resultWithError(errors.Errorf("Attribute %s is not indexed.", order.Attr))
 	}
 
-	tokenizers := schema.State().Tokenizer(order.Attr)
+	tokenizers := schema.State().Tokenizer(ctx, order.Attr)
 	var tokenizer tok.Tokenizer
 	for _, t := range tokenizers {
 		// Get the first sortable index.
@@ -223,11 +229,26 @@ func sortWithIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 		return resultWithError(errors.Errorf("Attribute %s is not sortable.", order.Attr))
 	}
 
+	var prefix []byte
+	if len(order.Langs) > 0 {
+		// Only one languge is allowed.
+		lang := order.Langs[0]
+		tokenizer = tok.GetTokenizerForLang(tokenizer, lang)
+		langTokenizer, ok := tokenizer.(tok.ExactTokenizer)
+		if !ok {
+			return resultWithError(errors.Errorf(
+				"Failed to get tokenizer for Attribute %s for language %s.", order.Attr, lang))
+		}
+		prefix = langTokenizer.Prefix()
+	} else {
+		prefix = []byte{tokenizer.Identifier()}
+	}
+
 	// Iterate over every bucket / token.
 	iterOpt := badger.DefaultIteratorOptions
 	iterOpt.PrefetchValues = false
 	iterOpt.Reverse = order.Desc
-	iterOpt.Prefix = x.IndexKey(order.Attr, string(tokenizer.Identifier()))
+	iterOpt.Prefix = x.IndexKey(order.Attr, string(prefix))
 	txn := pstore.NewTransactionAt(ts.ReadTs, false)
 	defer txn.Discard()
 	var seekKey []byte
@@ -236,7 +257,8 @@ func sortWithIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 		seekKey = nil // Would automatically seek to iterOpt.Prefix.
 	} else {
 		// We need to reach the last key of this index type.
-		seekKey = x.IndexKey(order.Attr, string(tokenizer.Identifier()+1))
+		prefix[len(prefix)-1]++
+		seekKey = x.IndexKey(order.Attr, string(prefix))
 	}
 	itr := txn.NewIterator(iterOpt)
 	defer itr.Close()
@@ -283,6 +305,45 @@ BUCKETS:
 		}
 	}
 
+	for i, ul := range ts.UidMatrix {
+		// nullNodes is list of UIDs for which the value of the sort predicate is null.
+		var nullNodes []uint64
+		// present is a map[uid]->bool to keep track of the UIDs containing the sort predicate.
+		present := make(map[uint64]bool)
+
+		// Add the UIDs to the map, which are in the resultant intersected list and the UIDs which
+		// have been skipped because of offset while intersection.
+		for _, uid := range codec.GetUids(out[i].ulist) {
+			present[uid] = true
+		}
+		for _, uid := range codec.GetUids(out[i].skippedUids) {
+			present[uid] = true
+		}
+
+		// nullPreds is a list of UIDs which doesn't contain the sort predicate.
+		for _, uid := range ul.SortedUids {
+			if _, ok := present[uid]; !ok {
+				nullNodes = append(nullNodes, uid)
+			}
+		}
+
+		// Apply the offset on null nodes, if the nodes with value were not enough.
+		if out[i].offset < len(nullNodes) {
+			nullNodes = nullNodes[out[i].offset:]
+		} else {
+			nullNodes = nullNodes[:0]
+		}
+		remainingCount := int(ts.Count) - len(codec.GetUids(r.UidMatrix[i]))
+		canAppend := x.Min(uint64(remainingCount), uint64(len(nullNodes)))
+		r.UidMatrix[i].SortedUids = append(r.UidMatrix[i].SortedUids, nullNodes[:canAppend]...)
+
+		// The value list also need to contain null values for the appended uids.
+		if len(ts.Order) > 1 {
+			nullVals := make([]types.Val, canAppend)
+			values[i] = append(values[i], nullVals...)
+		}
+	}
+
 	select {
 	case <-ctx.Done():
 		return resultWithError(ctx.Err())
@@ -307,25 +368,21 @@ func multiSort(ctx context.Context, r *sortresult, ts *pb.SortMessage) error {
 	// For each uid in dest uids, we have multiple values which belong to different attributes.
 	// 1  -> [ "Alice", 23, "1932-01-01"]
 	// 10 -> [ "Bob", 35, "1912-02-01" ]
-	sortVals := make([][]types.Val, len(dest.Uids))
+	sortVals := make(map[uint64][]types.Val, dest.GetCardinality())
 	for idx := range sortVals {
 		sortVals[idx] = make([]types.Val, len(ts.Order))
 	}
 
-	seen := make(map[uint64]struct{})
 	// Walk through the uidMatrix and put values for this attribute in sortVals.
 	for i, ul := range r.reply.UidMatrix {
-		x.AssertTrue(len(ul.Uids) == len(r.vals[i]))
-		for j, uid := range ul.Uids {
-			uidx := algo.IndexOf(dest, uid)
-			x.AssertTrue(uidx >= 0)
-
-			if _, ok := seen[uid]; ok {
+		x.AssertTrue(len(ul.SortedUids) == len(r.vals[i]))
+		for j, uid := range ul.SortedUids {
+			if _, ok := sortVals[uid]; ok {
 				// We have already seen this uid.
 				continue
 			}
-			seen[uid] = struct{}{}
-			sortVals[uidx][0] = r.vals[i][j]
+			sortVals[uid] = make([]types.Val, len(ts.Order))
+			sortVals[uid][0] = r.vals[i][j]
 		}
 	}
 
@@ -334,7 +391,7 @@ func multiSort(ctx context.Context, r *sortresult, ts *pb.SortMessage) error {
 	for i := 1; i < len(ts.Order); i++ {
 		in := &pb.Query{
 			Attr:    ts.Order[i].Attr,
-			UidList: dest,
+			UidList: codec.ToSortedList(dest),
 			Langs:   ts.Order[i].Langs,
 			ReadTs:  ts.ReadTs,
 		}
@@ -353,8 +410,10 @@ func multiSort(ctx context.Context, r *sortresult, ts *pb.SortMessage) error {
 		}
 
 		result := or.r
-		x.AssertTrue(len(result.ValueMatrix) == len(dest.Uids))
-		for i := range dest.Uids {
+		dsz := int(dest.GetCardinality())
+		x.AssertTrue(len(result.ValueMatrix) == dsz)
+		itr := dest.NewIterator()
+		for i := 0; itr.HasNext(); i++ {
 			var sv types.Val
 			if len(result.ValueMatrix[i].Values) == 0 {
 				// Assign nil value which is sorted as greater than all other values.
@@ -369,7 +428,8 @@ func multiSort(ctx context.Context, r *sortresult, ts *pb.SortMessage) error {
 					return err
 				}
 			}
-			sortVals[i][or.idx] = sv
+			uid := itr.Next()
+			sortVals[uid][or.idx] = sv
 		}
 	}
 
@@ -384,18 +444,16 @@ func multiSort(ctx context.Context, r *sortresult, ts *pb.SortMessage) error {
 
 	// Values have been accumulated, now we do the multisort for each list.
 	for i, ul := range r.reply.UidMatrix {
-		vals := make([][]types.Val, len(ul.Uids))
-		for j, uid := range ul.Uids {
-			idx := algo.IndexOf(dest, uid)
-			x.AssertTrue(idx >= 0)
-			vals[j] = sortVals[idx]
+		vals := make([][]types.Val, len(ul.SortedUids))
+		for j, uid := range ul.SortedUids {
+			vals[j] = sortVals[uid]
 		}
-		if err := types.Sort(vals, &ul.Uids, desc, ""); err != nil {
+		if err := types.Sort(vals, &ul.SortedUids, desc, ""); err != nil {
 			return err
 		}
 		// Paginate
-		start, end := x.PageRange(int(ts.Count), int(r.multiSortOffsets[i]), len(ul.Uids))
-		ul.Uids = ul.Uids[start:end]
+		start, end := x.PageRange(int(ts.Count), int(r.multiSortOffsets[i]), len(ul.SortedUids))
+		ul.SortedUids = ul.SortedUids[start:end]
 		r.reply.UidMatrix[i] = ul
 	}
 
@@ -427,16 +485,19 @@ func processSort(ctx context.Context, ts *pb.SortMessage) (*pb.SortResult, error
 	if ts.Count < 0 {
 		return nil, errors.Errorf(
 			"We do not yet support negative or infinite count with sorting: %s %d. "+
-				"Try flipping order and return first few elements instead.", ts.Order[0].Attr, ts.Count)
+				"Try flipping order and return first few elements instead.",
+			x.ParseAttr(ts.Order[0].Attr), ts.Count)
 	}
 	// TODO (pawan) - Why check only the first attribute, what if other attributes are of list type?
 	if schema.State().IsList(ts.Order[0].Attr) {
 		return nil, errors.Errorf("Sorting not supported on attr: %s of type: [scalar]",
-			ts.Order[0].Attr)
+			x.ParseAttr(ts.Order[0].Attr))
 	}
 
 	// We're not using any txn local cache here. So, no need to deal with that yet.
 	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	resCh := make(chan *sortresult, 2)
 	go func() {
 		select {
@@ -477,19 +538,12 @@ func processSort(ctx context.Context, ts *pb.SortMessage) (*pb.SortResult, error
 	return r.reply, err
 }
 
-func destUids(uidMatrix []*pb.List) *pb.List {
-	included := make(map[uint64]struct{})
+func destUids(uidMatrix []*pb.List) *sroar.Bitmap {
+	res := sroar.NewBitmap()
 	for _, ul := range uidMatrix {
-		for _, uid := range ul.Uids {
-			included[uid] = struct{}{}
-		}
+		out := codec.FromList(ul)
+		res.Or(out)
 	}
-
-	res := &pb.List{Uids: make([]uint64, 0, len(included))}
-	for uid := range included {
-		res.Uids = append(res.Uids, uid)
-	}
-	sort.Slice(res.Uids, func(i, j int) bool { return res.Uids[i] < res.Uids[j] })
 	return res
 }
 
@@ -510,6 +564,7 @@ func fetchValues(ctx context.Context, in *pb.Query, idx int, or chan orderResult
 type intersectedList struct {
 	offset          int
 	ulist           *pb.List
+	skippedUids     *pb.List
 	values          []types.Val
 	uset            map[uint64]struct{}
 	multiSortOffset int32
@@ -529,7 +584,7 @@ func intersectBucket(ctx context.Context, ts *pb.SortMessage, token string,
 
 	key := x.IndexKey(order.Attr, token)
 	// Don't put the Index keys in memory.
-	pl, err := posting.GetNoStore(key)
+	pl, err := posting.GetNoStore(key, ts.GetReadTs())
 	if err != nil {
 		return err
 	}
@@ -541,7 +596,7 @@ func intersectBucket(ctx context.Context, ts *pb.SortMessage, token string,
 		// We need to reduce multiSortOffset while checking the count as we might have included
 		// some extra uids from the bucket that the offset falls into. We are going to discard
 		// the first multiSortOffset number of uids later after all sorts are applied.
-		if count > 0 && len(il.ulist.Uids)-int(il.multiSortOffset) >= count {
+		if count > 0 && len(il.ulist.SortedUids)-int(il.multiSortOffset) >= count {
 			continue
 		}
 
@@ -549,22 +604,26 @@ func intersectBucket(ctx context.Context, ts *pb.SortMessage, token string,
 		listOpt := posting.ListOptions{
 			Intersect: ul,
 			ReadTs:    ts.ReadTs,
+			First:     0, // TODO: Should we set the first N here?
 		}
 		result, err := pl.Uids(listOpt) // The actual intersection work is done here.
 		if err != nil {
 			return err
 		}
+		codec.BitmapToSorted(result)
 
 		// Duplicates will exist between buckets if there are multiple language
 		// variants of a predicate.
-		result.Uids = removeDuplicates(result.Uids, il.uset)
+		result.SortedUids = removeDuplicates(result.SortedUids, il.uset)
 
 		// Check offsets[i].
-		n := len(result.Uids)
+		n := len(result.SortedUids)
 		if il.offset >= n {
 			// We are going to skip the whole intersection. No need to do actual
-			// sorting. Just update offsets[i]. We now offset less.
+			// sorting. Just update offsets[i]. We now offset less. Also, keep track of the UIDs
+			// that have been skipped for the offset.
 			il.offset -= n
+			il.skippedUids.SortedUids = append(il.skippedUids.SortedUids, result.SortedUids...)
 			continue
 		}
 
@@ -577,12 +636,16 @@ func intersectBucket(ctx context.Context, ts *pb.SortMessage, token string,
 
 		// Result set might have reduced after sorting. As some uids might not have a
 		// value in the lang specified.
-		n = len(result.Uids)
+		n = len(result.SortedUids)
 
 		if il.offset > 0 {
 			// Apply the offset.
 			if len(ts.Order) == 1 {
-				result.Uids = result.Uids[il.offset:n]
+				// Keep track of UIDs which had sort predicate but have been skipped because of
+				// the offset.
+				il.skippedUids.SortedUids = append(il.skippedUids.SortedUids,
+					result.SortedUids[:il.offset]...)
+				result.SortedUids = result.SortedUids[il.offset:n]
 			} else {
 				// In case of multi sort we can't apply the offset yet, as the order might change
 				// after other sort orders are applied. So we need to pick all the uids in the
@@ -592,20 +655,20 @@ func intersectBucket(ctx context.Context, ts *pb.SortMessage, token string,
 				il.multiSortOffset = int32(il.offset)
 			}
 			il.offset = 0
-			n = len(result.Uids)
+			n = len(result.SortedUids)
 		}
 
 		// n is number of elements to copy from result to out.
 		// In case of multiple sort, we don't want to apply the count and copy all uids for the
 		// current bucket.
 		if count > 0 && (len(ts.Order) == 1) {
-			slack := count - len(il.ulist.Uids)
+			slack := count - len(il.ulist.SortedUids)
 			if slack < n {
 				n = slack
 			}
 		}
 
-		il.ulist.Uids = append(il.ulist.Uids, result.Uids[:n]...)
+		il.ulist.SortedUids = append(il.ulist.SortedUids, result.SortedUids[:n]...)
 		if len(ts.Order) > 1 {
 			il.values = append(il.values, vals[:n]...)
 		}
@@ -615,12 +678,13 @@ func intersectBucket(ctx context.Context, ts *pb.SortMessage, token string,
 	for i := 0; i < len(ts.UidMatrix); i++ { // Iterate over UID lists.
 		// We need to reduce multiSortOffset while checking the count as we might have included
 		// some extra uids earlier for the multi-sort case.
-		if len(out[i].ulist.Uids)-int(out[i].multiSortOffset) < count {
+		if len(out[i].ulist.SortedUids)-int(out[i].multiSortOffset) < count {
 			return errContinue
 		}
 
 		if len(ts.Order) == 1 {
-			x.AssertTruef(len(out[i].ulist.Uids) == count, "%d %d", len(out[i].ulist.Uids), count)
+			x.AssertTruef(len(out[i].ulist.SortedUids) == count, "%d %d",
+				len(out[i].ulist.SortedUids), count)
 		}
 	}
 	// All UID lists have enough items (according to pagination). Let's notify
@@ -647,7 +711,7 @@ func removeDuplicates(uids []uint64, set map[uint64]struct{}) []uint64 {
 func paginate(ts *pb.SortMessage, dest *pb.List, vals []types.Val) (int, int, error) {
 	count := int(ts.Count)
 	offset := int(ts.Offset)
-	start, end := x.PageRange(count, offset, len(dest.Uids))
+	start, end := x.PageRange(count, offset, len(dest.SortedUids))
 
 	// For multiple sort, we need to take all equal values at the start and end.
 	// This is because the final sort order depends on other sort attributes and we can't ignore
@@ -663,7 +727,7 @@ func paginate(ts *pb.SortMessage, dest *pb.List, vals []types.Val) (int, int, er
 			}
 			start--
 		}
-		for end < len(dest.Uids) {
+		for end < len(dest.SortedUids) {
 			eq, err := types.Equal(vals[end-1], vals[end])
 			if err != nil {
 				return 0, 0, err
@@ -681,7 +745,7 @@ func paginate(ts *pb.SortMessage, dest *pb.List, vals []types.Val) (int, int, er
 // sortByValue fetches values and sort UIDList.
 func sortByValue(ctx context.Context, ts *pb.SortMessage, ul *pb.List,
 	typ types.TypeID) ([]types.Val, error) {
-	lenList := len(ul.Uids)
+	lenList := len(ul.SortedUids)
 	uids := make([]uint64, 0, lenList)
 	values := make([][]types.Val, 0, lenList)
 	multiSortVals := make([]types.Val, 0, lenList)
@@ -694,25 +758,31 @@ func sortByValue(ctx context.Context, ts *pb.SortMessage, ul *pb.List,
 		return nil, errors.Errorf("Sorting on multiple language is not supported.")
 	}
 
+	// nullsList is the list of UIDs for which value doesn't exist.
+	var nullsList []uint64
+	var nullVals [][]types.Val
 	for i := 0; i < lenList; i++ {
 		select {
 		case <-ctx.Done():
 			return multiSortVals, ctx.Err()
 		default:
-			uid := ul.Uids[i]
-			uids = append(uids, uid)
+			uid := ul.SortedUids[i]
 			val, err := fetchValue(uid, order.Attr, order.Langs, typ, ts.ReadTs)
 			if err != nil {
-				// Value couldn't be found or couldn't be converted to the sort
-				// type.  By using a nil Value, it will appear at the
-				// end (start) for orderasc (orderdesc).
+				// Value couldn't be found or couldn't be converted to the sort type.
+				// It will be appended to the end of the result based on the pagination.
 				val.Value = nil
+				nullsList = append(nullsList, uid)
+				nullVals = append(nullVals, []types.Val{val})
+				continue
 			}
+			uids = append(uids, uid)
 			values = append(values, []types.Val{val})
 		}
 	}
 	err := types.Sort(values, &uids, []bool{order.Desc}, lang)
-	ul.Uids = uids
+	ul.SortedUids = append(uids, nullsList...)
+	values = append(values, nullVals...)
 	if len(ts.Order) > 1 {
 		for _, v := range values {
 			multiSortVals = append(multiSortVals, v[0])
@@ -725,7 +795,7 @@ func sortByValue(ctx context.Context, ts *pb.SortMessage, ul *pb.List,
 func fetchValue(uid uint64, attr string, langs []string, scalar types.TypeID,
 	readTs uint64) (types.Val, error) {
 	// Don't put the values in memory
-	pl, err := posting.GetNoStore(x.DataKey(attr, uid))
+	pl, err := posting.GetNoStore(x.DataKey(attr, uid), readTs)
 	if err != nil {
 		return types.Val{}, err
 	}

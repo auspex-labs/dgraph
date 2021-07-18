@@ -24,9 +24,10 @@ import (
 	"io/ioutil"
 	"net/http"
 	"testing"
+	"time"
 
-	"github.com/dgraph-io/dgo/v2"
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v210"
+	"github.com/dgraph-io/dgo/v210/protos/api"
 	"github.com/dgraph-io/dgraph/testutil"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/stretchr/testify/require"
@@ -54,7 +55,9 @@ func TestQuery(t *testing.T) {
 	t.Run("hash index queries", wrap(QueryHashIndex))
 	t.Run("fuzzy matching", wrap(FuzzyMatch))
 	t.Run("regexp with toggled trigram index", wrap(RegexpToggleTrigramIndex))
+	t.Run("eq with altering order of trigram and term index", wrap(EqWithAlteredIndexOrder))
 	t.Run("groupby uid that works", wrap(GroupByUidWorks))
+	t.Run("parameterized cascade", wrap(CascadeParams))
 	t.Run("cleanup", wrap(SchemaQueryCleanup))
 }
 
@@ -65,12 +68,13 @@ func SchemaQueryCleanup(t *testing.T, c *dgo.Dgraph) {
 func MultipleBlockEval(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
+	op := &api.Operation{
 		Schema: `
       entity: string @index(exact) .
       stock: [uid] @reverse .
     `,
-	}))
+	}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -226,14 +230,15 @@ func MultipleBlockEval(t *testing.T, c *dgo.Dgraph) {
 func UnmatchedVarEval(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
+	op := &api.Operation{
 		Schema: `
       item: string @index(hash) .
       style.type: string .
       style.name: string .
       style.cool: bool .
     `,
-	}))
+	}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -318,9 +323,8 @@ func UnmatchedVarEval(t *testing.T, c *dgo.Dgraph) {
 func SchemaQueryTest(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
-		Schema: `name: string @index(exact) .`,
-	}))
+	op := &api.Operation{Schema: `name: string @index(exact) .`}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -329,43 +333,27 @@ func SchemaQueryTest(t *testing.T, c *dgo.Dgraph) {
 	require.NoError(t, err)
 	require.NoError(t, txn.Commit(ctx))
 
-	txn = c.NewTxn()
-	resp, err := txn.Query(ctx, `schema {}`)
-	require.NoError(t, err)
-	js := `
-  {
-    "schema": [` + x.AclPredicates + `,
-      {
-        "predicate": "dgraph.type",
-        "type": "string",
-        "index": true,
-        "tokenizer": [
-          "exact"
-        ],
-		"list": true
-      },
-      {
+	testutil.VerifySchema(t, c, testutil.SchemaOptions{UserPreds: `
+	  {
         "predicate": "name",
         "type": "string",
         "index": true,
         "tokenizer": [
           "exact"
         ]
-      }
-    ]
-  }`
-	testutil.CompareJSON(t, js, string(resp.Json))
+      }`})
 }
 
 func SchemaQueryTestPredicate1(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
+	op := &api.Operation{
 		Schema: `
       name: string @index(exact) .
       age: int .
     `,
-	}))
+	}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -386,15 +374,33 @@ func SchemaQueryTestPredicate1(t *testing.T, c *dgo.Dgraph) {
 	js := `
   {
     "schema": [
+	  {
+		"predicate": "dgraph.drop.op"
+	  },
+	  {
+		"predicate": "dgraph.graphql.p_query"
+	  },
       {
         "predicate": "dgraph.xid"
-      },
+	  },
       {
         "predicate": "dgraph.password"
       },
-      {
-        "predicate": "dgraph.group.acl"
-      },
+	  {
+		  "predicate": "dgraph.acl.rule"
+	  },
+	  {
+		  "predicate": "dgraph.rule.predicate"
+	  },
+	  {
+		  "predicate": "dgraph.rule.permission"
+	  },
+	  {
+        "predicate": "dgraph.graphql.schema"
+	  },
+	  {
+        "predicate": "dgraph.graphql.xid"
+	  },
       {
         "predicate": "dgraph.user.group"
       },
@@ -410,7 +416,9 @@ func SchemaQueryTestPredicate1(t *testing.T, c *dgo.Dgraph) {
       {
         "predicate": "age"
       }
-    ]
+    ],
+	"types": [` + testutil.GetInternalTypes(false) + `
+	]
   }`
 	testutil.CompareJSON(t, js, string(resp.Json))
 }
@@ -418,9 +426,8 @@ func SchemaQueryTestPredicate1(t *testing.T, c *dgo.Dgraph) {
 func SchemaQueryTestPredicate2(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
-		Schema: `name: string @index(exact) .`,
-	}))
+	op := &api.Operation{Schema: `name: string @index(exact) .`}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -451,12 +458,13 @@ func SchemaQueryTestPredicate2(t *testing.T, c *dgo.Dgraph) {
 func SchemaQueryTestPredicate3(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
+	op := &api.Operation{
 		Schema: `
       name: string @index(exact) .
       age: int .
     `,
-	}))
+	}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -494,9 +502,8 @@ func SchemaQueryTestPredicate3(t *testing.T, c *dgo.Dgraph) {
 func SchemaQueryTestHTTP(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
-		Schema: `name: string @index(exact) .`,
-	}))
+	op := &api.Operation{Schema: `name: string @index(exact) .`}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -505,9 +512,10 @@ func SchemaQueryTestHTTP(t *testing.T, c *dgo.Dgraph) {
 	require.NoError(t, err)
 	require.NoError(t, txn.Commit(ctx))
 
+	url := fmt.Sprintf("http://%s", testutil.SockAddrHttp)
 	var loginBb bytes.Buffer
 	loginBb.WriteString(`{"userid":"groot","password":"password"}`)
-	loginRes, err := http.Post("http://localhost:8180/login", "application/json", &loginBb)
+	loginRes, err := http.Post(url+"/login", "application/json", &loginBb)
 	require.NoError(t, err)
 	loginBody, err := ioutil.ReadAll(loginRes.Body)
 	require.NoError(t, err)
@@ -518,9 +526,9 @@ func SchemaQueryTestHTTP(t *testing.T, c *dgo.Dgraph) {
 	var bb bytes.Buffer
 	bb.WriteString(`schema{}`)
 	client := http.Client{}
-	req, err := http.NewRequest("POST", "http://localhost:8180/query", &bb)
+	req, err := http.NewRequest("POST", url+"/query", &bb)
 	require.NoError(t, err)
-	req.Header.Add("Content-Type", "application/graphql+-")
+	req.Header.Add("Content-Type", "application/dql")
 	req.Header.Add("X-Dgraph-AccessToken", accessJwt)
 	res, err := client.Do(req)
 	require.NoError(t, err)
@@ -535,38 +543,27 @@ func SchemaQueryTestHTTP(t *testing.T, c *dgo.Dgraph) {
 	require.NoError(t, json.Unmarshal(bb.Bytes(), &m))
 	require.NotNil(t, m["extensions"])
 
-	js := `
-  {
-    "schema": [` + x.AclPredicates + `,
-      {
-        "index": true,
-        "predicate": "dgraph.type",
-        "type": "string",
-        "tokenizer": ["exact"],
-		"list": true
-      },
-      {
+	testutil.CompareJSON(t, testutil.GetFullSchemaJSON(testutil.SchemaOptions{UserPreds: `
+	  {
         "predicate": "name",
         "type": "string",
         "index": true,
         "tokenizer": [
           "exact"
         ]
-      }
-    ]
-  }`
-	testutil.CompareJSON(t, js, string(m["data"]))
+      }`}), string(m["data"]))
 }
 
 func FuzzyMatch(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
+	op := &api.Operation{
 		Schema: `
       term: string @index(trigram) .
       name: string .
     `,
-	}))
+	}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -597,7 +594,7 @@ func FuzzyMatch(t *testing.T, c *dgo.Dgraph) {
 		in, out, failure string
 	}{
 		{
-			in:  `{q(func:match(term, drive, 8)) {term}}`,
+			in:  `{q(func:match(term, drive, 0)) {term}}`,
 			out: `{"q":[{"term":"drive"}]}`,
 		},
 		{
@@ -658,12 +655,19 @@ func FuzzyMatch(t *testing.T, c *dgo.Dgraph) {
 		{
 			in: `{q(func:match(term, "carigeway", 8)) {term}}`,
 			out: `{"q":[
-        {"term": "dual carriageway"}
+        {"term": "highway"},
+        {"term": "motorway"},
+        {"term": "dual carriageway"},
+        {"term": "pathway"},
+        {"term": "parkway"}
       ]}`,
 		},
 		{
-			in:  `{q(func:match(term, "carigeway", 4)) {term}}`,
-			out: `{"q":[]}`,
+			in: `{q(func:match(term, "carigeway", 4)) {term}}`,
+			out: `{"q":[
+        {"term": "highway"},
+        {"term": "parkway"}
+      ]}`,
 		},
 		{
 			in: `{q(func:match(term, "dualway", 8)) {term}}`,
@@ -695,14 +699,472 @@ func FuzzyMatch(t *testing.T, c *dgo.Dgraph) {
 	}
 }
 
+func CascadeParams(t *testing.T, c *dgo.Dgraph) {
+
+	ctx := context.Background()
+
+	op := &api.Operation{Schema: `name: string @index(fulltext) .`}
+	require.NoError(t, c.Alter(ctx, op))
+
+	txn := c.NewTxn()
+	_, err := txn.Mutate(ctx, &api.Mutation{
+		SetNquads: []byte(`
+		_:alice1 <name> "Alice 1" .
+		_:alice1 <age> "23" .
+		_:alice2 <name> "Alice 2" .
+		_:alice3 <name> "Alice 3" .
+		_:alice3 <age> "32" .
+		_:bob <name> "Bob" .
+		_:chris <name> "Chris" .
+		_:dave <name> "Dave" .
+		_:alice1 <friend> _:bob (close=true) .
+		_:alice1 <friend> _:dave .
+		_:alice2 <friend> _:chris (close=false) .
+		  _:bob <friend> _:chris .
+	`),
+	})
+	require.NoError(t, err)
+	require.NoError(t, txn.Commit(ctx))
+
+	tests := []struct {
+		in, out string
+	}{
+		{
+			// value preds Parameterized at root.
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) @cascade(name, age)   {
+					name
+					age
+					friend {
+						name
+					}
+				}
+		  	}`,
+			out: `{
+				"q": [
+				  {
+					"name": "Alice 1",
+					"age": "23",
+					"friend": [
+					  {
+						"name": "Bob"
+					  },
+					  {
+						"name": "Dave"
+					  }
+					]
+				  },
+				  {
+					"name": "Alice 3",
+					"age": "32"
+				  }
+				]
+			  }`,
+		},
+		// value and uid preds in root cascade params
+		{
+			in: `{
+				q(func: anyoftext(name, "Alice")) @cascade(name, age, friend)   {
+				  name
+				  age
+					  friend {
+					  name
+				  }
+				}
+			  }
+			  `,
+			out: `{
+				"q": [
+				  {
+					"name": "Alice 1",
+					"age": "23",
+					"friend": [
+					  {
+						"name": "Bob"
+					  },
+					  {
+						"name": "Dave"
+					  }
+					]
+				  }
+				]
+			  }`,
+		},
+		{
+			// Plain cascade at root, implicit at lower level
+			in: `{
+				q(func: anyoftext(name, "Alice")) @cascade {
+				  name
+				  age
+					friend {
+					  name
+				  	  age
+				  	}
+				}
+			}
+			  `,
+			out: `{
+				"q": []
+			}`,
+		},
+		{
+			// @cascade(__all__) is same as @cascade
+			in: `{
+				q(func: anyoftext(name, "Alice")) @cascade(__all__) {
+				  name
+				  age
+					friend {
+					  name
+				  	  age
+				  	}
+				}
+			}
+			  `,
+			out: `{
+				"q": []
+			}`,
+		},
+		{
+			// Plain cascade at root, explicit at lower level
+			in: `{
+				q(func: anyoftext(name, "Alice")) @cascade {
+				  name
+				  age
+					friend @cascade {
+					  name
+				  	  age
+				    }
+				}
+			}
+			  `,
+			out: `{
+				"q": []
+			}`,
+		},
+		{
+			// No cascade anywhere.
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) {
+				  name
+				  age
+				  friend {
+				    name
+				    age
+				  }
+				}
+			}
+			`,
+			out: `
+			{
+				"q": [
+				  {
+					"name": "Alice 1",
+					"age": "23",
+					"friend": [
+					  {
+						"name": "Bob"
+					  },
+					  {
+						"name": "Dave"
+					  }
+					]
+				  },
+				  {
+					"name": "Alice 2",
+					"friend": [
+					  {
+						"name": "Chris"
+					  }
+					]
+				  },
+				  {
+					"name": "Alice 3",
+					"age": "32"
+				  }
+				]
+			}
+			`,
+		},
+
+		// Parameterized at lower level.
+		{
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) {
+				  name
+				  age
+				  friend @cascade(name, age) {
+					name
+				    age
+				  }
+				}
+			}
+			`,
+			out: `
+			{
+				"q": [
+				  {
+					"name": "Alice 1",
+					"age": "23"
+				  },
+				  {
+					"name": "Alice 2"
+				  },
+				  {
+					"name": "Alice 3",
+					"age": "32"
+				  }
+				]
+			}
+			`,
+		},
+
+		// Parameterized at root and lower level.
+		{
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) @cascade(friend) {
+				  name
+				  age
+				  friend @cascade(name, age) {
+					name
+				    age
+				  }
+				}
+			}
+			`,
+			out: `
+			{
+				"q": []
+			}
+			`,
+		},
+
+		// cascade at root and parameterized at lower level.
+		{
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) @cascade {
+				  name
+				  friend @cascade(name) {
+						  name
+						  age
+				  }
+				}
+			}
+			`,
+			out: `
+			{
+				"q": [
+				  {
+					"name": "Alice 1",
+					"friend": [
+					  {
+						"name": "Bob"
+					  },
+					  {
+						"name": "Dave"
+					  }
+					]
+				  },
+				  {
+					"name": "Alice 2",
+					"friend": [
+					  {
+						"name": "Chris"
+					  }
+					]
+				  }
+				]
+			}
+			`,
+		},
+
+		// Param Cascade at root, facet filtering at lower level. Contrast this with
+		// next query/response.
+		{
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) @cascade(friend) {
+				  name
+				  age
+				  friend @facets(eq(close, false)) {
+					name
+				  }
+				}
+			}
+			`,
+			out: `
+			{
+				"q": [
+				  {
+					"name": "Alice 2",
+					"friend": [
+					  {
+						"name": "Chris"
+					  }
+					]
+				  }
+				]
+			}
+			`,
+		},
+
+		// @cascade at root, facet-filtering at lower level. This is why we implemented
+		// the Parameterized Cascade.
+		{
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) @cascade {
+				  name
+				  age
+				  friend @facets(eq(close, false)) {
+					name
+				  }
+				}
+			}
+			`,
+			out: `
+			{
+				"q": []
+			}
+			`,
+		},
+
+		// Parameterized at root, facet-filtering at next level. Implicit cascade at inner-levels.
+		{
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) @cascade(friend) {
+				  name
+				  age
+				  friend @facets(eq(close, true)) {
+					name
+					friend {
+					  name
+					}
+				  }
+				}
+			}
+			`,
+			out: `
+			{
+				"q": [
+				  {
+					"name": "Alice 1",
+					"age": "23",
+					"friend": [
+					  {
+						"name": "Bob",
+						"friend": [
+						  {
+							"name": "Chris"
+						  }
+						]
+					  }
+					]
+				  }
+				]
+			}
+			`,
+		},
+
+		// Same idea as above with facets' OR operator.
+		{
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) @cascade(friend) {
+				  name
+					age
+				    friend @facets(eq(close, true) OR eq(close, false)) {
+				      name
+				    }
+				}
+			}
+			`,
+			out: `
+			{
+				"q": [
+				  {
+					"name": "Alice 1",
+					"age": "23",
+					"friend": [
+					  {
+						"name": "Bob"
+					  }
+					]
+				  },
+				  {
+					"name": "Alice 2",
+					"friend": [
+					  {
+						"name": "Chris"
+					  }
+					]
+				  }
+				]
+			}
+			`,
+		},
+
+		// Non existent param in cascade - ignored.
+		{
+			in: `
+			{
+				q(func: anyoftext(name, "Alice")) @cascade(foo) {
+				  name
+					age
+         		    friend @facets(eq(close, true) OR eq(close, false)) {
+					  name
+					  age
+				    }
+				}
+			}
+			`,
+			out: `
+			{
+				"q": [
+					{
+					  "name": "Alice 1",
+					  "age": "23",
+					  "friend": [
+						{
+						  "name": "Bob"
+						}
+					  ]
+					},
+					{
+					  "name": "Alice 2",
+					  "friend": [
+						{
+						  "name": "Chris"
+						}
+					  ]
+					},
+					{
+					  "name": "Alice 3",
+					  "age": "32"
+					}
+				  ]
+			}
+			`,
+		},
+	}
+
+	for _, tc := range tests {
+		resp, err := c.NewTxn().Query(ctx, tc.in)
+		require.NoError(t, err)
+		testutil.CompareJSON(t, tc.out, string(resp.Json))
+	}
+}
+
 func QueryHashIndex(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
-		Schema: `
-      name: string @index(hash) @lang .
-    `,
-	}))
+	op := &api.Operation{Schema: `name: string @index(hash) @lang .`}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -811,11 +1273,8 @@ func QueryHashIndex(t *testing.T, c *dgo.Dgraph) {
 func RegexpToggleTrigramIndex(t *testing.T, c *dgo.Dgraph) {
 	ctx := context.Background()
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
-		Schema: `
-      name: string @index(term) @lang .
-    `,
-	}))
+	op := &api.Operation{Schema: `name: string @index(term) @lang .`}
+	require.NoError(t, c.Alter(ctx, op))
 
 	txn := c.NewTxn()
 	_, err := txn.Mutate(ctx, &api.Mutation{
@@ -856,11 +1315,8 @@ func RegexpToggleTrigramIndex(t *testing.T, c *dgo.Dgraph) {
 		testutil.CompareJSON(t, tc.out, string(resp.Json))
 	}
 
-	require.NoError(t, c.Alter(ctx, &api.Operation{
-		Schema: `
-      name: string @index(trigram) @lang .
-    `,
-	}))
+	op = &api.Operation{Schema: `name: string @index(trigram) @lang .`}
+	require.NoError(t, c.Alter(ctx, op))
 
 	t.Log("testing with trigram index")
 	for _, tc := range tests {
@@ -879,6 +1335,44 @@ func RegexpToggleTrigramIndex(t *testing.T, c *dgo.Dgraph) {
 	_, err = c.NewTxn().Query(ctx, `{q(func:regexp(name, /art/)) {name}}`)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Attribute name does not have trigram index for regex matching.")
+}
+
+func EqWithAlteredIndexOrder(t *testing.T, c *dgo.Dgraph) {
+	ctx := context.Background()
+
+	// first, let's set the schema with term before trigram
+	op := &api.Operation{Schema: `name: string @index(term, trigram) .`}
+	require.NoError(t, c.Alter(ctx, op))
+
+	// fill up some data
+	txn := c.NewTxn()
+	_, err := txn.Mutate(ctx, &api.Mutation{
+		SetNquads: []byte(`
+      _:x1 <name> "Alice" .
+      _:x2 <name> "Bob" .
+    `),
+	})
+	require.NoError(t, err)
+	require.NoError(t, txn.Commit(ctx))
+
+	// querying with eq should work
+	q := `{q(func: eq(name, "Alice")) {name}}`
+	expectedResult := `{"q":[{"name":"Alice"}]}`
+	resp, err := c.NewReadOnlyTxn().Query(ctx, q)
+	require.NoError(t, err)
+	testutil.CompareJSON(t, expectedResult, string(resp.Json))
+
+	// now, let's set the schema with trigram before term
+	err = x.RetryUntilSuccess(1, time.Second, func() error {
+		op = &api.Operation{Schema: `name: string @index(trigram, term) .`}
+		return c.Alter(ctx, op)
+	})
+	require.NoError(t, err)
+
+	// querying with eq should still work
+	resp, err = c.NewReadOnlyTxn().Query(ctx, q)
+	require.NoError(t, err)
+	testutil.CompareJSON(t, expectedResult, string(resp.Json))
 }
 
 func GroupByUidWorks(t *testing.T, c *dgo.Dgraph) {

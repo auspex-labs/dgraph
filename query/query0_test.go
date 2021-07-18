@@ -17,14 +17,13 @@
 package query
 
 import (
+	"context"
 	"os"
 	"testing"
 
-	context "golang.org/x/net/context"
-
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/dgo/v2"
+	"github.com/dgraph-io/dgo/v210"
 	"github.com/dgraph-io/dgraph/gql"
 	"github.com/dgraph-io/dgraph/testutil"
 	"github.com/dgraph-io/dgraph/x"
@@ -316,6 +315,63 @@ func TestGtAge(t *testing.T) {
 	require.JSONEq(t, `{"data": {"senior_citizens":[]}}`, js)
 }
 
+func TestBetweenAge(t *testing.T) {
+	query := `
+    {
+			senior_citizens(func: between(age, 18, 30)) {
+				name
+				age
+			}
+    }`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `
+		{
+			"data": {
+				"senior_citizens": [
+					{
+						"name": "Andrea",
+						"age": 19
+					},
+					{
+						"name": "Alice",
+						"age": 25
+					},
+					{
+						"name": "Bob",
+						"age": 25
+					},
+					{
+						"name": "Colin",
+						"age": 25
+					},
+					{
+						"name": "Elizabeth",
+						"age": 25
+					}
+				]
+			}
+		}
+	`, js)
+}
+
+func TestBetweenAgeEmptyResponse(t *testing.T) {
+	query := `
+    {
+			senior_citizens(func: between(age, 30, 18)) {
+				name
+				age
+			}
+    }`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `
+		{
+			"data": {
+				"senior_citizens": []
+			}
+		}
+	`, js)
+}
+
 func TestLeAge(t *testing.T) {
 	query := `{
 		  minors(func: le(age, 15)) {
@@ -431,19 +487,97 @@ func TestCascadeDirective(t *testing.T) {
 		js)
 }
 
+func TestCascadeWithPaginationDeep(t *testing.T) {
+	query := `
+	{
+		me(func: type("Person")) @cascade{
+		  name
+		  friend {
+			name
+			friend(first: 2, offset: 1) {
+			  name
+			  alive
+			}
+		  }
+		}
+	  }
+	`
+
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data":{"me":[{"name":"Rick Grimes","friend":[{"name": "Michonne","friend":[{"name":"Daryl Dixon","alive":false},{"name": "Andrea","alive": false}]}]}]}}`, js)
+}
+
+func TestCascadeWithPaginationAtRoot(t *testing.T) {
+	query := `
+	{
+		me(func: type(Person), first: 2, offset: 2) @cascade{
+		  name
+		  alive
+		}
+	  }
+	`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data":{"me":[{"name":"Andrea","alive":false}]}}`, js)
+}
+
+func TestCascadeWithPaginationAndOffsetZero(t *testing.T) {
+	query := `
+	{
+		me(func: type(Person), first: 1, offset: 0) @cascade{
+		  name
+		  alive
+		}
+	  }
+	`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data":{"me":[{"name":"Rick Grimes","alive":true}]}}`, js)
+}
+
+func TestCascadeWithSort(t *testing.T) {
+	query := `
+	{
+		me(func: type(Person), first: 2, offset: 1, orderasc: name) @cascade{
+			name
+			alive
+		}
+	}
+	`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data":{"me":[{"name": "Daryl Dixon","alive": false},{"name": "Rick Grimes","alive": true}]}}`, js)
+}
+
 func TestLevelBasedFacetVarAggSum(t *testing.T) {
 	query := `
 		{
 			friend(func: uid(1000)) {
-				path @facets(L1 as weight)
+				path @facets(L1 as weight) {
+					uid
+				}
 				sumw: sum(val(L1))
 			}
 		}
 	`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"friend":[{"path":[{"path|weight":0.100000},{"path|weight":0.700000}],"sumw":0.800000}]}}`,
-		js)
+	require.JSONEq(t, `
+	{
+		"data": {
+		  "friend": [
+			{
+			  "path": [
+				{
+				  "uid": "0x3e9",
+				  "path|weight": 0.1
+				},
+				{
+				  "uid": "0x3ea",
+				  "path|weight": 0.7
+				}
+			  ],
+			  "sumw": 0.8
+			}
+		  ]
+		}
+	}`, js)
 }
 
 func TestLevelBasedFacetVarSum(t *testing.T) {
@@ -465,7 +599,53 @@ func TestLevelBasedFacetVarSum(t *testing.T) {
 		}
 	`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t, `{"data":{"friend":[{"path":[{"path":[{"count(follow)":1,"val(L4)":1.200000,"path|weight":0.100000},{"count(follow)":1,"val(L4)":3.900000,"path|weight":1.500000}],"path|weight":0.100000},{"path":[{"count(follow)":1,"val(L4)":3.900000,"path|weight":0.600000}],"path|weight":0.700000}]}],"sum":[{"name":"John","val(L4)":3.900000},{"name":"Matt","val(L4)":1.200000}]}}`,
+	require.JSONEq(t, `
+		{
+		  "data": {
+		    "friend": [
+		      {
+		        "path": [
+		          {
+		            "path": [
+		              {
+		                "count(follow)": 1,
+		                "val(L4)": 1.2,
+		                "path|weight": 0.1
+		              },
+		              {
+		                "count(follow)": 1,
+		                "val(L4)": 3.9,
+		                "path|weight": 1.5
+		              }
+		            ],
+		            "path|weight": 0.1
+		          },
+		          {
+		            "path": [
+		              {
+		                "count(follow)": 1,
+		                "val(L4)": 3.9,
+		                "path|weight": 0.6
+		              }
+		            ],
+		            "path|weight": 0.7
+		          }
+		        ]
+		      }
+		    ],
+		    "sum": [
+		      {
+		        "name": "John",
+		        "val(L4)": 3.9
+		      },
+		      {
+		        "name": "Matt",
+		        "val(L4)": 1.2
+		      }
+		    ]
+		  }
+		}
+	`,
 		js)
 }
 
@@ -485,9 +665,37 @@ func TestLevelBasedSumMix1(t *testing.T) {
 		}
 	`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"friend":[{"age":38,"path":[{"val(L2)":38.200000,"path|weight":0.200000},{"val(L2)":38.100000,"path|weight":0.100000}]}],"sum":[{"name":"Glenn Rhee","val(L2)":38.200000},{"name":"Andrea","val(L2)":38.100000}]}}`,
-		js)
+	require.JSONEq(t, `
+		{
+			"data": {
+			  "friend": [
+				{
+				  "age": 38,
+				  "path": [
+					{
+					  "val(L2)": 38.2,
+					  "path|weight": 0.2
+					},
+					{
+					  "val(L2)": 38.1,
+					  "path|weight": 0.1
+					}
+				  ]
+				}
+			  ],
+			  "sum": [
+				{
+				  "name": "Glenn Rhee",
+				  "val(L2)": 38.2
+				},
+				{
+				  "name": "Andrea",
+				  "val(L2)": 38.1
+				}
+			  ]
+			}
+		}
+	`, js)
 }
 
 func TestLevelBasedFacetVarSum1(t *testing.T) {
@@ -508,9 +716,52 @@ func TestLevelBasedFacetVarSum1(t *testing.T) {
 		}
 	`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"friend":[{"path":[{"name":"Bob","path":[{"val(L3)":0.200000,"path|weight":0.100000},{"val(L3)":2.900000,"path|weight":1.500000}],"path|weight":0.100000},{"name":"Matt","path":[{"val(L3)":2.900000,"path|weight":0.600000}],"path|weight":0.700000}]}],"sum":[{"name":"John","val(L3)":2.900000},{"name":"Matt","val(L3)":0.200000}]}}`,
-		js)
+	require.JSONEq(t, `
+        {
+          "data": {
+            "friend": [
+              {
+                "path": [
+                  {
+                    "name": "Bob",
+                    "path": [
+                      {
+                        "val(L3)": 0.2,
+                        "path|weight": 0.1
+                      },
+                      {
+                        "val(L3)": 2.9,
+                        "path|weight": 1.5
+                      }
+                    ],
+                    "path|weight": 0.1
+                  },
+                  {
+                    "name": "Matt",
+                    "path": [
+                      {
+                        "val(L3)": 2.9,
+                        "path|weight": 0.6
+                      }
+                    ],
+                    "path|weight": 0.7
+                  }
+                ]
+              }
+            ],
+            "sum": [
+              {
+                "name": "John",
+                "val(L3)": 2.9
+              },
+              {
+                "name": "Matt",
+                "val(L3)": 0.2
+              }
+            ]
+          }
+        }
+	`, js)
 }
 
 func TestLevelBasedFacetVarSum2(t *testing.T) {
@@ -532,9 +783,63 @@ func TestLevelBasedFacetVarSum2(t *testing.T) {
 		}
 	`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"friend":[{"path":[{"path":[{"path":[{"val(L4)":0.800000,"path|weight":0.600000}],"path|weight":0.100000},{"path":[{"val(L4)":2.900000}],"path|weight":1.500000}],"path|weight":0.100000},{"path":[{"path":[{"val(L4)":2.900000}],"path|weight":0.600000}],"path|weight":0.700000}]}],"sum":[{"name":"Bob","val(L4)":2.900000},{"name":"John","val(L4)":0.800000}]}}`,
-		js)
+	require.JSONEq(t, `
+        {
+          "data": {
+            "friend": [
+              {
+                "path": [
+                  {
+                    "path": [
+                      {
+                        "path": [
+                          {
+                            "val(L4)": 0.8,
+                            "path|weight": 0.6
+                          }
+                        ],
+                        "path|weight": 0.1
+                      },
+                      {
+                        "path": [
+                          {
+                            "val(L4)": 2.9
+                          }
+                        ],
+                        "path|weight": 1.5
+                      }
+                    ],
+                    "path|weight": 0.1
+                  },
+                  {
+                    "path": [
+                      {
+                        "path": [
+                          {
+                            "val(L4)": 2.9
+                          }
+                        ],
+                        "path|weight": 0.6
+                      }
+                    ],
+                    "path|weight": 0.7
+                  }
+                ]
+              }
+            ],
+            "sum": [
+              {
+                "name": "Bob",
+                "val(L4)": 2.9
+              },
+              {
+                "name": "John",
+                "val(L4)": 0.8
+              }
+            ]
+          }
+        }
+	`, js)
 }
 
 func TestQueryConstMathVal(t *testing.T) {
@@ -552,8 +857,28 @@ func TestQueryConstMathVal(t *testing.T) {
 	`
 	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
-		`{"data": {"AgeOrder":[{"name":"Michonne","val(a)":9.000000},{"name":"Rick Grimes","val(a)":9.000000},{"name":"Andrea","val(a)":9.000000},{"name":"Andrea With no friends","val(a)":9.000000}]}}`,
-		js)
+		`{
+			"data": {
+				"AgeOrder":[
+					{
+						"name":"Michonne",
+						"val(a)":9.000000
+					},
+					{
+						"name":"Rick Grimes",
+						"val(a)":9.000000
+					},
+					{
+						"name":"Andrea",
+						"val(a)":9.000000
+					},
+					{
+						"name":"Andrea With no friends",
+						"val(a)":9.000000
+					}
+				]
+			}
+		}`, js)
 }
 
 func TestQueryVarValAggSince(t *testing.T) {
@@ -1159,6 +1484,70 @@ func TestGroupByRootAlias(t *testing.T) {
 	require.JSONEq(t, `{"data":{"me":[{"@groupby":[{"age":17,"Count":1},{"age":19,"Count":1},{"age":38,"Count":1},{"age":15,"Count":2}]}]}}`, js)
 }
 
+func TestGroupByCountValVar(t *testing.T) {
+	query := `
+	{
+		var(func: uid(1, 23, 24, 25, 31)) @groupby(age) {
+			c as count(uid)
+		}
+		me(func: uid(c)) {
+			uid
+			val: val(c)
+		}
+	}
+	`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data":{"me":[{"uid": "0x1","val":1},{"uid": "0x17","val": 2},{"uid": "0x18","val": 2},{"uid": "0x19","val": 1},{"uid": "0x1f","val": 1}]}}`, js)
+}
+
+func TestGroupByCountValVarFilter(t *testing.T) {
+	query := `
+	{
+		var(func: uid(1, 23, 24, 25, 31)) @groupby(age) {
+			c as count(uid)
+		}
+		me(func: uid(c)) @filter(ge(val(c),2)) {
+			name
+			val: val(c)
+		}
+	}
+	`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data":{"me": [{"name": "Rick Grimes","val": 2},{"name": "Glenn Rhee","val": 2}]}}`, js)
+}
+
+func TestGroupByMultiCountValVar(t *testing.T) {
+	query := `
+	{
+		var(func: uid(1, 23, 24, 25, 31)) @groupby(name,age) {
+			c as count(uid)
+		}
+		me(func: uid(c)) {
+			name
+			val: val(c)
+		}
+	}
+	`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data": {"me": [{"name": "Michonne","val": 1},{"name": "Rick Grimes","val": 1},{"name": "Glenn Rhee","val": 1},{"name": "Daryl Dixon","val": 1},{"name": "Andrea","val": 1}]}}`, js)
+}
+
+func TestGroupByCountUidValVar(t *testing.T) {
+	query := `
+	{
+		var(func: uid(1, 23, 24)) @groupby(school, age) {
+		  c as count(uid)
+		}
+		me(func: uid(c))  {
+		  name
+		  val: val(c)
+		}
+	  }
+	`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data": {"me": [{"name": "Michonne","val": 1},{"name": "Rick Grimes","val": 1},{"name": "Glenn Rhee","val": 1}]}}`, js)
+}
+
 func TestGroupByRootAlias2(t *testing.T) {
 	query := `
 	{
@@ -1541,9 +1930,32 @@ func TestFilterFacetval(t *testing.T) {
 		}
 	`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"friend":[{"path":[{"name":"Glenn Rhee","path|weight":0.200000},{"name":"Andrea","friend":[{"name":"Glenn Rhee","val(L)":0.200000}],"path|weight":0.100000}]}]}}`,
-		js)
+	require.JSONEq(t, `
+		{
+			"data": {
+			  "friend": [
+				{
+				  "path": [
+					{
+					  "name": "Glenn Rhee",
+					  "path|weight": 0.2
+					},
+					{
+					  "name": "Andrea",
+					  "friend": [
+						{
+						  "name": "Glenn Rhee",
+						  "val(L)": 0.2
+						}
+					  ],
+					  "path|weight": 0.1
+					}
+				  ]
+				}
+			  ]
+			}
+		}
+	`, js)
 }
 
 func TestFilterFacetVar1(t *testing.T) {
@@ -1561,9 +1973,25 @@ func TestFilterFacetVar1(t *testing.T) {
 		}
 	`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"friend":[{"path":[{"name":"Glenn Rhee"},{"name":"Andrea","path|weight1":0.200000}]}]}}`,
-		js)
+	require.JSONEq(t, `
+	{
+		"data": {
+		  "friend": [
+			{
+			  "path": [
+				{
+				  "name": "Glenn Rhee"
+				},
+				{
+				  "name": "Andrea",
+				  "path|weight1": 0.2
+				}
+			  ]
+			}
+		  ]
+		}
+	}
+	`, js)
 }
 
 func TestUseVarsFilterVarReuse1(t *testing.T) {
@@ -1970,7 +2398,6 @@ func TestFilterUsingLenFunction(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		t.Log("Running: ", tc.name)
 		js := processQueryNoErr(t, tc.in)
 		require.JSONEq(t, tc.out, js)
 	}
@@ -2104,13 +2531,63 @@ func TestNonFlattenedResponse(t *testing.T) {
 func TestDateTimeQuery(t *testing.T) {
 	var query string
 
+	// Test 23
+	query = `
+{
+	q(func: between(graduation, "1931-01-01", "1932-03-01")) {
+		uid
+		graduation
+	}
+}
+`
+	require.JSONEq(t,
+		`{"data":{"q":[{"uid":"0x1","graduation":["1932-01-01T00:00:00Z"]}]}}`,
+		processQueryNoErr(t, query))
+
+	// Test 22
+	query = `
+{
+	q(func: between(graduation, "1932-03-01", "1950-01-01")) {
+		uid
+		graduation
+	}
+}
+`
+	require.JSONEq(t,
+		`{"data":{"q":[{"uid":"0x1f","graduation":["1935-01-01T00:00:00Z","1933-01-01T00:00:00Z"]}]}}`,
+		processQueryNoErr(t, query))
+
+	// Test 21
+	query = `
+{
+  q(func: between(created_at, "2021-03-28T14:41:57+30:00", "2019-03-28T15:41:57+30:00"), orderdesc: created_at) {
+	  uid
+	  created_at
+  }
+}
+`
+	require.JSONEq(t, `{"data":{"q":[]}}`, processQueryNoErr(t, query))
+
+	// Test 20
+	query = `
+{
+  q(func: between(created_at, "2019-03-28T14:41:57+30:00", "2019-03-28T15:41:57+30:00"), orderdesc: created_at) {
+	  uid
+	  created_at
+	}
+}
+`
+	require.JSONEq(t,
+		`{"data":{"q":[{"uid":"0x130","created_at":"2019-03-28T15:41:57+30:00"},{"uid":"0x12d","created_at":"2019-03-28T14:41:57+30:00"},{"uid":"0x12e","created_at":"2019-03-28T13:41:57+29:00"},{"uid":"0x12f","created_at":"2019-03-27T14:41:57+06:00"}]}}`,
+		processQueryNoErr(t, query))
+
 	// Test 19
 	query = `
 {
   q(func: has(created_at), orderdesc: created_at) {
 		uid
 		created_at
-  }
+	}
 }
 `
 	require.JSONEq(t,
@@ -2128,9 +2605,21 @@ func TestDateTimeQuery(t *testing.T) {
 	}
 }
 `
-	require.JSONEq(t,
-		`{"data":{"q":[{"uid":"0x3","best_friend":{"uid":"0x40","best_friend|since":"2018-03-24T14:41:57+05:30"}}]}}`,
-		processQueryNoErr(t, query))
+	require.JSONEq(t, `
+		{
+			"data": {
+			  "q": [
+				{
+				  "uid": "0x3",
+				  "best_friend": {
+					"uid": "0x40",
+				    "best_friend|since": "2018-03-24T14:41:57+05:30"
+				  }
+				}
+			  ]
+			}
+		}
+	`, processQueryNoErr(t, query))
 
 	// Test 17
 	query = `
@@ -2143,9 +2632,22 @@ func TestDateTimeQuery(t *testing.T) {
 	}
 }
 `
-	require.JSONEq(t,
-		`{"data":{"q":[{"uid":"0x2","best_friend":{"uid":"0x40","best_friend|since":"2019-03-28T14:41:57+30:00"}}]}}`,
-		processQueryNoErr(t, query))
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `
+		{
+			"data": {
+			  "q": [
+				{
+				  "uid": "0x2",
+				  "best_friend": {
+					"uid": "0x40",
+				    "best_friend|since": "2019-03-28T14:41:57+30:00"
+				  }
+				}
+			  ]
+			}
+		}
+	`, js)
 
 	// Test 16
 	query = `
@@ -2370,6 +2872,725 @@ func TestCountUidWithAlias(t *testing.T) {
 	require.JSONEq(t,
 		`{"data":{"me":[{"countUid":5},{"name":"Michonne"},{"name":"Rick Grimes"},{"name":"Glenn Rhee"},{"name":"Daryl Dixon"},{"name":"Andrea"}]}}`,
 		js)
+}
+
+func TestFilterNonIndexedPredicate(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		query  string
+		result string
+	}{
+		{
+			`Test ge filter on non-indexed string`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(ge(noindex_name, "Leonard's name not indexed")) {
+					noindex_name
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_name":"Michonne's name not indexed"},{"noindex_name":"Margaret's name not indexed"},{"noindex_name":"Leonard's name not indexed"}]}}`,
+		},
+		{
+			`Test gt filter on non-indexed string`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(gt(noindex_name, "Leonard's name not indexed")) {
+					noindex_name
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_name":"Michonne's name not indexed"},{"noindex_name":"Margaret's name not indexed"}]}}`,
+		},
+		{
+			`Test le filter on non-indexed string`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(le(noindex_name, "Leonard's name not indexed")) {
+					noindex_name
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_name":"King Lear's name not indexed"},{"noindex_name":"Leonard's name not indexed"}]}}`,
+		},
+		{
+			`Test lt filter on non-indexed string`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(lt(noindex_name, "Leonard's name not indexed")){
+					noindex_name
+				}
+			},
+			`,
+			`{"data":{"me":[{"noindex_name":"King Lear's name not indexed"}]}}`,
+		},
+		{
+			`Test eq filter on non-indexed string`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(eq(noindex_name, "King Lear's name not indexed")) {
+					noindex_name
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_name":"King Lear's name not indexed"}]}}`,
+		},
+		{
+			`Test ge filter on non-indexed int`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(ge(noindex_age, "22")) {
+					noindex_age
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_age":22},{"noindex_age":23},{"noindex_age":24}]}}`,
+		},
+		{
+			`Test gt filter on non-indexed int`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(gt(noindex_age, "22")) {
+					noindex_age
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_age":23},{"noindex_age":24}]}}`,
+		},
+		{
+			`Test le filter on non-indexed int`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(le(noindex_age, "22")) {
+					noindex_age
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_age":21},{"noindex_age":22}]}}`,
+		},
+		{
+			`Test lt filter on non-indexed int`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(lt(noindex_age, "22")){
+					noindex_age
+				}
+			},
+			`,
+			`{"data":{"me":[{"noindex_age":21}]}}`,
+		},
+		{
+			`Test eq filter on non-indexed int`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(eq(noindex_age, "22")) {
+					noindex_age
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_age":22}]}}`,
+		},
+		{
+			`Test ge filter on non-indexed datetime`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(ge(noindex_dob, "1610-11-01")) {
+					noindex_dob
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_dob":"1810-11-01T00:00:00Z"},{"noindex_dob":"1710-11-01T00:00:00Z"},{"noindex_dob":"1610-11-01T00:00:00Z"}]}}`,
+		},
+		{
+			`Test gt filter on non-indexed datetime`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(gt(noindex_dob, "1610-11-01")) {
+					noindex_dob
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_dob":"1810-11-01T00:00:00Z"},{"noindex_dob":"1710-11-01T00:00:00Z"}]}}`,
+		},
+		{
+			`Test le filter on non-indexed datetime`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(le(noindex_dob, "1610-11-01")) {
+					noindex_dob
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_dob":"1610-11-01T00:00:00Z"},{"noindex_dob":"1510-11-01T00:00:00Z"}]}}`,
+		},
+		{
+			`Test lt filter on non-indexed datetime`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(lt(noindex_dob, "1610-11-01")){
+					noindex_dob
+				}
+			},
+			`,
+			`{"data":{"me":[{"noindex_dob":"1510-11-01T00:00:00Z"}]}}`,
+		},
+		{
+			`Test eq filter on non-indexed datetime`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(eq(noindex_dob, "1610-11-01")) {
+					noindex_dob
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_dob":"1610-11-01T00:00:00Z"}]}}`,
+		},
+		{
+			`Test ge filter on non-indexed float`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(ge(noindex_salary, "589.04")) {
+					noindex_salary
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_salary":589.040000},{"noindex_salary":967.680000}]}}`,
+		},
+		{
+			`Test gt filter on non-indexed float`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(gt(noindex_salary, "589.04")) {
+					noindex_salary
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_salary":967.680000}]}}`,
+		},
+		{
+			`Test le filter on non-indexed float`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(le(noindex_salary, "589.04")) {
+					noindex_salary
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_salary":501.230000},{"noindex_salary":589.040000},{"noindex_salary":459.470000}]}}`,
+		},
+		{
+			`Test lt filter on non-indexed float`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(lt(noindex_salary, "589.04")){
+					noindex_salary
+				}
+			},
+			`,
+			`{"data":{"me":[{"noindex_salary":501.230000},{"noindex_salary":459.470000}]}}`,
+		},
+		{
+			`Test eq filter on non-indexed float`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(eq(noindex_salary, "589.04")) {
+					noindex_salary
+				}
+			}
+			`,
+			`{"data":{"me":[{"noindex_salary":589.040000}]}}`,
+		},
+		{
+			`Test eq filter on non-indexed bool`,
+			`
+			{
+				me(func: uid(1, 2, 3, 4)) @filter(eq(noindex_alive, true)) {
+					uid
+					noindex_name
+					noindex_alive
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x1","noindex_name":"Michonne's name not indexed","noindex_alive":true},{"uid":"0x4","noindex_name":"Leonard's name not indexed","noindex_alive":true}]}}`,
+		},
+		{
+			`Test filtering of non indexed predicate inside query`,
+			`
+			{
+				me(func: uid(0x01)) {
+					friend @filter(ge(survival_rate, 1.6)) {
+						name
+						survival_rate
+					}
+				}
+			}
+			`,
+			`{"data":{"me":[{"friend":[{"name":"Rick Grimes","survival_rate":1.600000},{"name":"Glenn Rhee","survival_rate":1.600000},{"name":"Daryl Dixon","survival_rate":1.600000},{"name":"Andrea","survival_rate":1.600000}]}]}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := processQueryNoErr(t, tc.query)
+			require.JSONEq(t, js, tc.result)
+		})
+	}
+}
+
+func TestBetweenString(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		query  string
+		result string
+	}{
+		{
+			`Test between string on predicate with lang tag`,
+			`
+			{
+				me(func: between(name, "", "Alice")) {
+					uid
+					name
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x33","name":"A"},{"uid":"0x6e","name":"Alice"},{"uid":"0x3e8","name":"Alice"},{"uid":"0xdac","name":""},{"uid":"0xdad","name":"Alex"},{"uid":"0xdae","name":""},{"uid":"0x2710","name":"Alice"},{"uid":"0x2712","name":"Alice"},{"uid":"0x2714","name":"Alice"}]}}`,
+		},
+		{
+			`Test between string on predicate with lang tag when bounds are invalid`,
+			`
+			{
+				me(func: between(name, "Alice", "")) {
+					uid
+					name
+				}
+			}
+			`,
+			`{"data":{"me":[]}}`,
+		},
+		{
+			`Test between string on predicate without lang tag when bounds are invalid`,
+			`
+			{
+				me(func: between(newname, "P", "P1")) {
+					uid
+					newname
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x1f5","newname":"P1"}]}}`,
+		},
+		{
+			`Test between string on predicate without lang tag when bounds are invalid`,
+			`
+			{
+				me(func: between(newname, "P1", "P5")) {
+					uid
+					newname
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x1f5","newname":"P1"},{"uid":"0x1f6","newname":"P2"},{"uid":"0x1f7","newname":"P3"},{"uid":"0x1f8","newname":"P4"},{"uid":"0x1f9","newname":"P5"},{"uid":"0x1fe","newname":"P10"},{"uid":"0x1ff","newname":"P11"},{"uid":"0x200","newname":"P12"}]}}`,
+		},
+		{
+			`Test between string on predicate of list type`,
+			`
+			{
+				me(func: between(pet_name, "a", "z")) {
+					uid
+					pet_name
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x4e20","pet_name":["little master","master blaster"]},{"uid":"0x4e21","pet_name":["mahi","ms"]}]}}`,
+		},
+		{
+			`Test between string on predicate of list type with partial match`,
+			`
+			{
+				me(func: between(pet_name, "a", "mahi")) {
+					uid
+					pet_name
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x4e20","pet_name":["little master","master blaster"]},{"uid":"0x4e21","pet_name":["mahi","ms"]}]}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := processQueryNoErr(t, tc.query)
+			require.JSONEq(t, js, tc.result)
+		})
+	}
+}
+
+func TestBetweenFloat(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		query  string
+		result string
+	}{
+		{
+			`Test between salary all results`,
+			`
+			{
+				me(func: between(salary, "9999.0000", "10003.0000")) {
+					uid
+					salary
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x2710","salary":10000.000000},{"uid":"0x2712","salary":10002.000000}]}}`,
+		},
+		{
+			`Test between salary 1 result`,
+			`
+			{
+				me(func: between(salary, "10000.1000", "10002.1000")) {
+					uid
+					salary
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x2712","salary":10002.000000}]}}`,
+		},
+		{
+			`Test between salary empty response`,
+			`
+			{
+				me(func: between(salary, "10000.1000", "10001.1000")) {
+					uid
+					salary
+				}
+			}
+			`,
+			`{"data":{"me":[]}}`,
+		},
+		{
+			`Test between salary invalid args`,
+			`
+			{
+				me(func: between(salary, "10010.1000", "10001.1000")) {
+					uid
+					salary
+				}
+			}
+			`,
+			`{"data":{"me":[]}}`,
+		},
+		{
+			`Test between for float list`,
+			`
+			{
+				me(func: between(average, "30", "50")) {
+					uid
+					average
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x4e20","average":[46.930000,55.100000]},{"uid":"0x4e21","average":[35.200000,49.330000]}]}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := processQueryNoErr(t, tc.query)
+			require.JSONEq(t, js, tc.result)
+		})
+	}
+}
+
+func TestBetweenInt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		query  string
+		result string
+	}{
+		{
+			`Test between on int list predicate`,
+			`
+			{
+				me(func: between(score, "50", "70")) {
+					uid
+					score
+				}
+			}
+			`,
+			`{"data":{"me":[{"uid":"0x4e20","score":[56,90]},{"uid":"0x4e21","score":[85,68]}]}}`,
+		},
+		{
+			`Test between on int list predicate empty respone`,
+			`
+			{
+				me(func: between(score, "1", "30")) {
+					uid
+					score
+				}
+			}
+			`,
+			`{"data":{"me":[]}}`,
+		},
+		{
+			`Test between on int`,
+			`
+			{
+				senior_citizens(func: between(age, 18, 30)) {
+					name
+					age
+				}
+			}
+			`,
+			`{"data": {"senior_citizens": [{"name": "Andrea","age": 19},{"name": "Alice","age": 25},{"name": "Bob","age": 25},{"name": "Colin","age": 25},{"name": "Elizabeth","age": 25}]}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := processQueryNoErr(t, tc.query)
+			require.JSONEq(t, js, tc.result)
+		})
+	}
+}
+
+func TestBetweenCount(t *testing.T) {
+	tests := []struct {
+		name   string
+		query  string
+		result string
+	}{
+		{
+			`Test between on valid bounds`,
+			`
+			{
+				me(func: between(count(friend), 1, 3)) {
+					name
+				}
+			}
+			`,
+			`{"data":{"me":[{"name":"Rick Grimes"},{"name":"Andrea"}]}}`,
+		},
+		{
+			`Test between on count equal bounds`,
+			`
+			{
+				me(func: between(count(friend), 5, 5)) {
+					name
+				}
+			}
+			`,
+			`{"data":{"me":[{"name":"Michonne"}]}}`,
+		},
+		{
+			`Test between on count invalid bounds`,
+			`
+			{
+				me(func: between(count(friend), 3, 1)) {
+					name
+				}
+			}
+			`,
+			`{"data":{"me":[]}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := processQueryNoErr(t, tc.query)
+			require.JSONEq(t, js, tc.result)
+		})
+	}
+}
+
+func TestBetweenWithIndex(t *testing.T) {
+	tests := []struct {
+		name   string
+		query  string
+		result string
+	}{
+		{
+			`Test Between on Indexed Predicate`,
+			`{
+				me(func :has(newname))  @filter(between(newname,"P1","P3")){
+					newname
+				  }
+			 }`,
+			`{"data": {"me": [{"newname": "P1"},{"newname": "P2"},{"newname": "P3"},{"newname": "P10"},{"newname": "P11"},{"newname": "P12"}]}}`,
+		},
+		{
+			`Test Between on Indexed Predicate at child Node`,
+			`{
+				me(func :has(newname))  @filter(between(newname,"P12","P2")){
+					newname
+					newfriend @filter(between(newname, "P3", "P5")){
+					  newname
+					}
+				  }
+			 }`,
+			`{"data": {"me": [{"newname": "P2", "newfriend": [{"newname": "P5"}]},{"newname": "P12"}]}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := processQueryNoErr(t, tc.query)
+			require.JSONEq(t, js, tc.result)
+		})
+	}
+}
+func TestBetweenWithoutIndex(t *testing.T) {
+	tests := []struct {
+		name   string
+		query  string
+		result string
+	}{
+		{
+			`Test Between on Non Indexed Predicate`,
+			`
+			{
+				me(func: type(CarModel)) @filter(between(year,2009,2010)){
+					make
+					model
+					year
+				}
+			}
+			`,
+			`{"data":{"me":[{"make":"Ford","model":"Focus","year":2009},{"make":"Toyota","model":"Prius","year":2009}]}}`,
+		},
+		{
+			`Test Between filter at child node`,
+			`
+			{
+				me(func :has(newage)) @filter(between(newage,20,24)) {
+					newage
+					newfriend @filter(between(newage,25,30)){
+					  newage
+					}
+				 }
+			}
+			`,
+			`{"data": {"me": [{"newage": 21},{"newage": 22,"newfriend": [{"newage": 25},{"newage": 26}]},{"newage": 23,"newfriend": [{"newage": 27},{"newage": 28}]},{"newage": 24,"newfriend": [{"newage": 29},{"newage": 30}]}]}}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := processQueryNoErr(t, tc.query)
+			require.JSONEq(t, js, tc.result)
+		})
+	}
+
+}
+
+func TestEqFilterWithoutIndex(t *testing.T) {
+	test := struct {
+		name   string
+		query  string
+		result string
+	}{
+		`Test eq filter on Non Indexed Predicate`,
+		`
+		{
+			me(func: type(CarModel)) @filter(eq(year,2008,2009)){
+				make
+				model
+				year
+			}
+		}
+		`,
+		`{"data":{"me":[{"make":"Ford","model":"Focus","year":2008},{"make":"Ford","model":"Focus","year":2009},{"make":"Toyota","model":"Prius","year":2009}]}}`,
+	}
+
+	js := processQueryNoErr(t, test.query)
+	require.JSONEq(t, js, test.result)
+
+}
+
+func TestMatchingWithPagination(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected string
+	}{
+		{
+			`Test regexp matching with pagination`,
+			`{
+				me(func: regexp(tweet-a, /aaa.b/), first:1){
+					tweet-a
+				}
+			 }`,
+			`{"data":{"me":[{"tweet-a":"aaaab"}]}}`,
+		},
+		{
+			`Test term matching with pagination`,
+			`{
+				me(func: allofterms(tweet-b, "indiana jones"), first:1){
+					tweet-b
+				}
+			 }`,
+			`{"data":{"me":[{"tweet-b":"indiana jones"}]}}`,
+		},
+		{
+			`Test full-text matching with pagination`,
+			`{
+				me(func: alloftext(tweet-c, "I am a citizen of Paradis Island"), first:1){
+					tweet-c
+				}
+			 }`,
+			`{"data":{"me":[{"tweet-c":"I am a citizen of Paradis Island"}]}}`,
+		},
+		{
+			`Test match function with pagination`,
+			`{
+				me(func: match(tweet-d, "aaaaaa", 3), first:1) {
+					tweet-d
+				}
+			 }`,
+			`{"data":{"me":[{"tweet-d":"aaabcd"}]}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := processQueryNoErr(t, tc.query)
+			require.JSONEq(t, tc.expected, result)
+		})
+	}
+}
+
+func TestKRandomNodes(t *testing.T) {
+	q := `{
+		data(func: uid(61, 62, 63, 64, 65, 66, 67, 68), random: 2) @filter(has(connects)) {
+			kname
+			connects(random:2){
+				kname
+			}
+		}
+	}`
+	result := processQueryNoErr(t, q)
+	expected := `{"data":{"data":[{
+		"kname":"can_be_picked",
+		"connects":[
+			{"kname":"yes"},
+			{"kname":"yes"}
+			]},
+		{"kname":"can_be_picked",
+		"connects":[
+			{"kname":"yes"},
+			{"kname":"yes"}
+		]}]}}`
+	require.JSONEq(t, expected, result)
+
+	q = `{
+		data(func: uid(61, 62, 63, 64, 65, 66, 67, 68), random: 10) @filter(has(connects)) {
+			count(uid)
+		}
+	}`
+	result = processQueryNoErr(t, q)
+	require.JSONEq(t, `{"data":{"data":[{"count":3}]}}`, result)
 }
 
 var client *dgo.Dgraph

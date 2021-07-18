@@ -18,8 +18,8 @@
 
 ## Getting Started
 
-- Read the [Getting Started Guide](https://docs.dgraph.io/get-started/)
-- [Take the Dgraph tour](https://tour.dgraph.io)
+- Read the [Getting Started Guide](https://dgraph.io/docs/get-started/)
+- [Take the Dgraph tour](https://dgraph.io/tour/)
 
 ## Setting Up the Development Environment
 
@@ -91,9 +91,8 @@ Commit timestamp : 2019-12-16 18:24:50 -0800
 Branch           : HEAD
 Go version       : go1.13.5
 
-For Dgraph official documentation, visit https://docs.dgraph.io.
+For Dgraph official documentation, visit https://dgraph.io/docs/.
 For discussions about Dgraph     , visit https://discuss.dgraph.io.
-To say hi to the community       , visit https://dgraph.slack.com.
 
 Licensed variously under the Apache Public License 2.0 and Dgraph Community License.
 Copyright 2015-2018 Dgraph Labs, Inc.
@@ -126,16 +125,15 @@ Commit timestamp : 2019-12-16 20:52:06 -0800
 Branch           : master
 Go version       : go1.13.5
 
-For Dgraph official documentation, visit https://docs.dgraph.io.
+For Dgraph official documentation, visit https://dgraph.io/docs/.
 For discussions about Dgraph     , visit https://discuss.dgraph.io.
-To say hi to the community       , visit https://dgraph.slack.com.
 
 Licensed variously under the Apache Public License 2.0 and Dgraph Community License.
 Copyright 2015-2018 Dgraph Labs, Inc.
 ```
 
 For release images, follow [Doing a release](#doing-a-release). It creates
-Docker images that contains `dgraph`, `dgraph-ratel`, and `badger` commands.
+Docker images that contains `dgraph` and `badger` commands.
 
 ### Testing
 
@@ -209,7 +207,7 @@ Run `go test` in the root folder.
 
 * Once the draft release is published on Github by Travis, modify it to add the release notes. The release
   notes would mostly be the same as changes for the current version in `CHANGELOG.md`. Finally publish the 
-  release and announce to users on community Slack.
+  release and announce to users on [Discourse](https://discuss.dgraph.io).
 
 * To make sure that docs are added for the newly released version, add the version to
    `wiki/scripts/build.sh`. It is also important for a release branch for the version to exist,

@@ -59,14 +59,18 @@ func (s byValue) Less(i, j int) bool {
 		return false
 	}
 	for vidx := range first {
-		// Null value is considered greatest hence comes at first place while doing descending sort
-		// and at last place while doing ascending sort.
-		if first[vidx].Value == nil {
+		// Null values are appended at the end of the sort result for both ascending and descending.
+		// If both first and second has nil values, then maintain the order by UID.
+		if first[vidx].Value == nil && second[vidx].Value == nil {
 			return s.desc[vidx]
 		}
 
+		if first[vidx].Value == nil {
+			return false
+		}
+
 		if second[vidx].Value == nil {
-			return !s.desc[vidx]
+			return true
 		}
 
 		// We have to look at next value to decide.
@@ -84,6 +88,16 @@ func (s byValue) Less(i, j int) bool {
 	return false
 }
 
+// IsSortable returns true, if tid is sortable. Otherwise it returns false.
+func IsSortable(tid TypeID) bool {
+	switch tid {
+	case DateTimeID, IntID, FloatID, StringID, DefaultID:
+		return true
+	default:
+		return false
+	}
+}
+
 // SortWithFacet sorts the given array in-place and considers the given facets to calculate
 // the proper ordering.
 func SortWithFacet(v [][]Val, ul *[]uint64, l []*pb.Facets, desc []bool, lang string) error {
@@ -91,12 +105,10 @@ func SortWithFacet(v [][]Val, ul *[]uint64, l []*pb.Facets, desc []bool, lang st
 		return nil
 	}
 
-	typ := v[0][0].Tid
-	switch typ {
-	case DateTimeID, IntID, FloatID, StringID, DefaultID:
-		// Don't do anything, we can sort values of this type.
-	default:
-		return errors.Errorf("Value of type: %s isn't sortable", typ.Name())
+	for _, val := range v[0] {
+		if !IsSortable(val.Tid) {
+			return errors.Errorf("Value of type: %s isn't sortable", val.Tid.Name())
+		}
 	}
 
 	var cl *collate.Collator

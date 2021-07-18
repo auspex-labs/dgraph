@@ -36,6 +36,7 @@ const (
 	typFunc   = "type"
 	lenFunc   = "len"
 	countFunc = "count"
+	uidInFunc = "uid_in"
 )
 
 var (
@@ -67,14 +68,16 @@ type GraphQuery struct {
 	Recurse          bool
 	RecurseArgs      RecurseArgs
 	ShortestPathArgs ShortestPathArgs
-	Cascade          bool
+	Cascade          []string
 	IgnoreReflex     bool
 	Facets           *pb.FacetParams
 	FacetsFilter     *FilterTree
 	GroupbyAttrs     []GroupByAttr
 	FacetVar         map[string]string
-	FacetOrder       string
-	FacetDesc        bool
+	FacetsOrder      []*FacetOrder
+
+	// Used for ACL enabled queries to curtail results to only accessible params
+	AllowedPreds []string
 
 	// Internal fields below.
 	// If gq.fragment is nonempty, then it is a fragment reference / spread.
@@ -108,6 +111,12 @@ type GroupByAttr struct {
 	Attr  string
 	Alias string
 	Langs []string
+}
+
+// FacetOrder stores ordering for single facet key.
+type FacetOrder struct {
+	Key  string
+	Desc bool // true if ordering should be decending by this facet.
 }
 
 // pair denotes the key value pair that is part of the GraphQL query root in parenthesis.
@@ -363,9 +372,6 @@ func substituteVariables(gq *GraphQuery, vmap varMap) error {
 
 	idVal, ok := gq.Args["id"]
 	if ok && len(gq.UID) == 0 {
-		if idVal == "" {
-			return errors.Errorf("Id can't be empty")
-		}
 		uids, err := parseID(idVal)
 		if err != nil {
 			return err
@@ -459,20 +465,24 @@ func regExpVariableFilter(f *Function, idx int) error {
 }
 
 func substituteVariablesFilter(f *FilterTree, vmap varMap) error {
+	if f == nil {
+		return nil
+	}
+
 	if f.Func != nil {
 		if err := substituteVar(f.Func.Attr, &f.Func.Attr, vmap); err != nil {
 			return err
 		}
 
 		for idx, v := range f.Func.Args {
+			if !v.IsGraphQLVar {
+				continue
+			}
 			if f.Func.Name == uidFunc {
 				// This is to support GraphQL variables in uid functions.
 				idVal, ok := vmap[v.Value]
 				if !ok {
 					return errors.Errorf("Couldn't find value for GraphQL variable: [%s]", v.Value)
-				}
-				if idVal.Value == "" {
-					return errors.Errorf("Id can't be empty")
 				}
 				uids, err := parseID(idVal.Value)
 				if err != nil {
@@ -523,6 +533,23 @@ type Result struct {
 // from the lexed items.
 func Parse(r Request) (Result, error) {
 	return ParseWithNeedVars(r, nil)
+}
+
+func LexQuery(req string) []lex.Item {
+	var l lex.Lexer
+	l.Reset(req)
+	l.Run(lexTopLevel)
+	it := l.NewIterator()
+
+	var res []lex.Item
+	for it.Next() {
+		item := it.Item()
+		res = append(res, item)
+		if item.Typ == lex.ItemError {
+			return res
+		}
+	}
+	return res
 }
 
 // ParseWithNeedVars performs parsing of a query with given needVars.
@@ -949,7 +976,9 @@ L:
 			case "normalize":
 				gq.Normalize = true
 			case "cascade":
-				gq.Cascade = true
+				if err := parseCascade(it, gq); err != nil {
+					return nil, err
+				}
 			case "groupby":
 				gq.IsGroupby = true
 				if err := parseGroupby(it, gq); err != nil {
@@ -1544,11 +1573,11 @@ loop:
 	return nil
 }
 
-// parseIneqArgs will try to parse the arguments inside an array ([]). If the values
+// parseFuncArgs will try to parse the arguments inside an array ([]). If the values
 // are prefixed with $ they are treated as Gql variables, otherwise they are used as scalar values.
 // Returns nil on success while appending arguments to the function Args slice. Otherwise
 // returns an error, which can be a parsing or value error.
-func parseIneqArgs(it *lex.ItemIterator, g *Function) error {
+func parseFuncArgs(it *lex.ItemIterator, g *Function) error {
 	var expectArg, isDollar bool
 
 	expectArg = true
@@ -1601,7 +1630,7 @@ func getValueArg(val string) (string, error) {
 }
 
 func validFuncName(name string) bool {
-	if isGeoFunc(name) || isInequalityFn(name) {
+	if isGeoFunc(name) || IsInequalityFn(name) {
 		return true
 	}
 
@@ -1702,7 +1731,7 @@ L:
 						return nil,
 							itemInFunc.Errorf("Multiple variables not allowed in len function")
 					}
-					if !isInequalityFn(function.Name) {
+					if !IsInequalityFn(function.Name) {
 						return nil,
 							itemInFunc.Errorf("len function only allowed inside inequality" +
 								" function")
@@ -1713,8 +1742,22 @@ L:
 				case countFunc:
 					function.Attr = nestedFunc.Attr
 					function.IsCount = true
+				case uidFunc:
+					// TODO (Anurag): See if is is possible to support uid(1,2,3) when
+					// uid is nested inside a function like @filter(uid_in(predicate, uid()))
+					if len(nestedFunc.NeedsVar) != 1 {
+						return nil,
+							itemInFunc.Errorf("Nested uid fn expects 1 uid variable, got %v", len(nestedFunc.NeedsVar))
+					}
+					if len(nestedFunc.UID) != 0 {
+						return nil,
+							itemInFunc.Errorf("Nested uid fn expects only uid variable, got UID")
+					}
+					function.NeedsVar = append(function.NeedsVar, nestedFunc.NeedsVar...)
+					function.NeedsVar[0].Typ = UidVar
+					function.Args = append(function.Args, Arg{Value: nestedFunc.NeedsVar[0].Name})
 				default:
-					return nil, itemInFunc.Errorf("Only val/count/len allowed as function "+
+					return nil, itemInFunc.Errorf("Only val/count/len/uid allowed as function "+
 						"within another. Got: %s", nestedFunc.Name)
 				}
 				expectArg = false
@@ -1751,8 +1794,11 @@ L:
 				case isGeoFunc(function.Name):
 					err = parseGeoArgs(it, function)
 
-				case isInequalityFn(function.Name):
-					err = parseIneqArgs(it, function)
+				case IsInequalityFn(function.Name):
+					err = parseFuncArgs(it, function)
+
+				case function.Name == "uid_in":
+					err = parseFuncArgs(it, function)
 
 				default:
 					err = itemInFunc.Errorf("Unexpected character [ while parsing request.")
@@ -1824,6 +1870,9 @@ L:
 				if strings.ContainsRune(itemInFunc.Val, '"') {
 					return nil, itemInFunc.Errorf("Attribute in function"+
 						" must not be quoted with \": %s", itemInFunc.Val)
+				}
+				if function.Name == uidInFunc && item.Typ == itemRightRound {
+					return nil, itemInFunc.Errorf("uid_in function expects an argument, got none")
 				}
 				function.Attr = val
 				attrItemsAgo = 0
@@ -1898,11 +1947,10 @@ L:
 }
 
 type facetRes struct {
-	f          *pb.FacetParams
-	ft         *FilterTree
-	vmap       map[string]string
-	facetOrder string
-	orderdesc  bool
+	f           *pb.FacetParams
+	ft          *FilterTree
+	vmap        map[string]string
+	facetsOrder []*FacetOrder
 }
 
 func parseFacets(it *lex.ItemIterator) (res facetRes, err error) {
@@ -2002,15 +2050,15 @@ func tryParseFacetList(it *lex.ItemIterator) (res facetRes, parseOk bool, err er
 
 	facetVar := make(map[string]string)
 	var facets pb.FacetParams
-	var orderdesc bool
-	var orderkey string
+	var facetsOrder []*FacetOrder
 
 	if _, ok := tryParseItemType(it, itemRightRound); ok {
 		// @facets() just parses to an empty set of facets.
-		res.f, res.vmap, res.facetOrder, res.orderdesc = &facets, facetVar, orderkey, orderdesc
+		res.f, res.vmap, res.facetsOrder = &facets, facetVar, facetsOrder
 		return res, true, nil
 	}
 
+	facetsOrderKeys := make(map[string]struct{})
 	for {
 		// We've just consumed a leftRound or a comma.
 
@@ -2037,12 +2085,13 @@ func tryParseFacetList(it *lex.ItemIterator) (res facetRes, parseOk bool, err er
 				Alias: facetItem.alias,
 			})
 			if facetItem.ordered {
-				if orderkey != "" {
+				if _, ok := facetsOrderKeys[facetItem.name]; ok {
 					return res, false,
-						facetItemIt.Errorf("Invalid use of orderasc/orderdesc in facets")
+						it.Errorf("Sorting by facet: [%s] can only be done once", facetItem.name)
 				}
-				orderdesc = facetItem.orderdesc
-				orderkey = facetItem.name
+				facetsOrderKeys[facetItem.name] = struct{}{}
+				facetsOrder = append(facetsOrder,
+					&FacetOrder{Key: facetItem.name, Desc: facetItem.orderdesc})
 			}
 		}
 
@@ -2062,7 +2111,7 @@ func tryParseFacetList(it *lex.ItemIterator) (res facetRes, parseOk bool, err er
 			}
 			out = append(out, facets.Param[flen-1])
 			facets.Param = out
-			res.f, res.vmap, res.facetOrder, res.orderdesc = &facets, facetVar, orderkey, orderdesc
+			res.f, res.vmap, res.facetsOrder = &facets, facetVar, facetsOrder
 			return res, true, nil
 		}
 		if item, ok := tryParseItemType(it, itemComma); !ok {
@@ -2077,6 +2126,69 @@ func tryParseFacetList(it *lex.ItemIterator) (res facetRes, parseOk bool, err er
 				"Expected ',' or ')' in facet list: %s", item.Val)
 		}
 	}
+}
+
+// parseCascade parses the cascade directive.
+// Two formats:
+// 	1. @cascade
+//  2. @cascade(pred1, pred2, ...)
+func parseCascade(it *lex.ItemIterator, gq *GraphQuery) error {
+	item := it.Item()
+	items, err := it.Peek(1)
+	if err != nil {
+		return item.Errorf("Unable to peek lexer after cascade")
+	}
+
+	// check if it is without any args:
+	// 1. @cascade {
+	// 2. @cascade }
+	// 3. @cascade @
+	// 4. @cascade\n someOtherPred
+	if items[0].Typ == itemLeftCurl || items[0].Typ == itemRightCurl || items[0].
+		Typ == itemAt || items[0].Typ == itemName {
+		// __all__ implies @cascade i.e.  implies values for all the children are mandatory.
+		gq.Cascade = append(gq.Cascade, "__all__")
+		return nil
+	}
+
+	count := 0
+	expectArg := true
+	it.Next()
+	item = it.Item()
+	if item.Typ != itemLeftRound {
+		return item.Errorf("Expected a left round after cascade, got: %s", item.String())
+	}
+
+loop:
+	for it.Next() {
+		item := it.Item()
+		switch item.Typ {
+		case itemRightRound:
+			break loop
+		case itemComma:
+			if expectArg {
+				return item.Errorf("Expected a predicate but got comma")
+			}
+			expectArg = true
+		case itemName:
+			if !expectArg {
+				return item.Errorf("Expected a comma or right round but got: %v", item.Val)
+			}
+			gq.Cascade = append(gq.Cascade, collectName(it, item.Val))
+			count++
+			expectArg = false
+		default:
+			return item.Errorf("Unexpected item while parsing: %v", item.Val)
+		}
+	}
+	if expectArg {
+		// use the initial item to report error line and column numbers
+		return item.Errorf("Unnecessary comma in cascade()")
+	}
+	if count == 0 {
+		return item.Errorf("At least one predicate required in parameterized cascade()")
+	}
+	return nil
 }
 
 // parseGroupby parses the groupby directive.
@@ -2249,8 +2361,11 @@ loop:
 // Parses ID list. Only used for GraphQL variables.
 // TODO - Maybe get rid of this by lexing individual IDs.
 func parseID(val string) ([]uint64, error) {
-	var uids []uint64
 	val = x.WhiteSpace.Replace(val)
+	if val == "" {
+		return nil, errors.Errorf("ID can't be empty")
+	}
+	var uids []uint64
 	if val[0] != '[' {
 		uid, err := strconv.ParseUint(val, 0, 64)
 		if err != nil {
@@ -2309,7 +2424,7 @@ loop:
 			expectArg = true
 		case itemName:
 			if !expectArg {
-				return count, item.Errorf("Expected a variable but got comma")
+				return count, item.Errorf("Expected a variable but got %s", item.Val)
 			}
 			count++
 			gq.NeedsVar = append(gq.NeedsVar, VarContext{
@@ -2342,7 +2457,7 @@ loop:
 			expectArg = true
 		case itemName:
 			if !expectArg {
-				return item.Errorf("Expected a variable but got comma")
+				return item.Errorf("Expected a variable but got %s", item.Val)
 			}
 			typeList = fmt.Sprintf("%s,%s", typeList, item.Val)
 			expectArg = false
@@ -2397,8 +2512,7 @@ func parseDirective(it *lex.ItemIterator, curp *GraphQuery) error {
 		switch {
 		case res.f != nil:
 			curp.FacetVar = res.vmap
-			curp.FacetOrder = res.facetOrder
-			curp.FacetDesc = res.orderdesc
+			curp.FacetsOrder = res.facetsOrder
 			if curp.Facets != nil {
 				return item.Errorf("Only one facets allowed")
 			}
@@ -2416,7 +2530,9 @@ func parseDirective(it *lex.ItemIterator, curp *GraphQuery) error {
 			return item.Errorf("Facets parsing failed.")
 		}
 	case item.Val == "cascade":
-		curp.Cascade = true
+		if err := parseCascade(it, curp); err != nil {
+			return err
+		}
 	case item.Val == "normalize":
 		curp.Normalize = true
 	case peek[0].Typ == itemLeftRound:
@@ -2463,7 +2579,7 @@ func parseDirective(it *lex.ItemIterator, curp *GraphQuery) error {
 func parseLanguageList(it *lex.ItemIterator) ([]string, error) {
 	item := it.Item()
 	var langs []string
-	for ; item.Typ == itemName || item.Typ == itemPeriod; item = it.Item() {
+	for ; item.Typ == itemName || item.Typ == itemPeriod || item.Typ == itemStar; item = it.Item() {
 		langs = append(langs, item.Val)
 		it.Next()
 		if it.Item().Typ == itemColon {
@@ -2496,7 +2612,7 @@ func parseLanguageList(it *lex.ItemIterator) ([]string, error) {
 
 func validKeyAtRoot(k string) bool {
 	switch k {
-	case "func", "orderasc", "orderdesc", "first", "offset", "after":
+	case "func", "orderasc", "orderdesc", "first", "offset", "after", "random":
 		return true
 	case "from", "to", "numpaths", "minweight", "maxweight":
 		// Specific to shortest path
@@ -2510,7 +2626,7 @@ func validKeyAtRoot(k string) bool {
 // Check for validity of key at non-root nodes.
 func validKey(k string) bool {
 	switch k {
-	case "orderasc", "orderdesc", "first", "offset", "after":
+	case "orderasc", "orderdesc", "first", "offset", "after", "random":
 		return true
 	}
 	return false
@@ -3214,9 +3330,9 @@ func isGeoFunc(name string) bool {
 	return name == "near" || name == "contains" || name == "within" || name == "intersects"
 }
 
-func isInequalityFn(name string) bool {
+func IsInequalityFn(name string) bool {
 	switch name {
-	case "eq", "le", "ge", "gt", "lt":
+	case "eq", "le", "ge", "gt", "lt", "between":
 		return true
 	}
 	return false

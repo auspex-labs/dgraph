@@ -13,25 +13,59 @@
 package enc
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"io"
+
+	"github.com/dgraph-io/badger/v3/y"
 	"github.com/dgraph-io/dgraph/x"
-	"io/ioutil"
+	"github.com/pkg/errors"
 )
 
 // EeBuild indicates if this is a Enterprise build.
 var EeBuild = true
 
-// ReadEncryptionKeyFile returns the encryption key in the given file.
-func ReadEncryptionKeyFile(filepath string) []byte {
-	if filepath == "" {
-		return nil
+// GetWriter wraps a crypto StreamWriter using the input key on the input Writer.
+func GetWriter(key x.Sensitive, w io.Writer) (io.Writer, error) {
+	// No encryption, return the input writer as is.
+	if key == nil {
+		return w, nil
 	}
-	k, err := ioutil.ReadFile(filepath)
-	x.Checkf(err, "Error reading encryption key file (%v)", filepath)
+	// Encryption, wrap crypto StreamWriter on the input Writer.
+	c, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	iv, err := y.GenerateIV()
+	if err != nil {
+		return nil, err
+	}
+	if iv != nil {
+		if _, err = w.Write(iv); err != nil {
+			return nil, err
+		}
+	}
+	return cipher.StreamWriter{S: cipher.NewCTR(c, iv), W: w}, nil
+}
 
-	// len must be 16,24,32 bytes if given. All other lengths are invalid.
-	klen := len(k)
-	x.AssertTruef(klen == 16 || klen == 24 || klen == 32,
-		"Invalid encryption key length = %v", klen)
+// GetReader wraps a crypto StreamReader using the input key on the input Reader.
+func GetReader(key x.Sensitive, r io.Reader) (io.Reader, error) {
+	// No encryption, return input reader as is.
+	if key == nil {
+		return r, nil
+	}
 
-	return k
+	// Encryption, wrap crypto StreamReader on input Reader.
+	c, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	var iv []byte = make([]byte, 16)
+	cnt, err := r.Read(iv)
+	if cnt != 16 || err != nil {
+		err = errors.Errorf("unable to get IV from encrypted backup. Read %v bytes, err %v ",
+			cnt, err)
+		return nil, err
+	}
+	return cipher.StreamReader{S: cipher.NewCTR(c, iv), R: r}, nil
 }

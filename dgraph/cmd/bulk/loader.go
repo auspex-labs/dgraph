@@ -20,19 +20,27 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"hash/adler32"
 	"io"
 	"io/ioutil"
+	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/y"
+	"google.golang.org/grpc/credentials"
+
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/y"
 
 	"github.com/dgraph-io/dgraph/chunker"
+	"github.com/dgraph-io/dgraph/ee/enc"
+	"github.com/dgraph-io/dgraph/filestore"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/x"
@@ -45,12 +53,13 @@ type options struct {
 	DataFiles        string
 	DataFormat       string
 	SchemaFile       string
+	GqlSchemaFile    string
 	OutDir           string
 	ReplaceOutDir    bool
 	TmpDir           string
-	BadgerKeyFile    string // used only in enterprise build. nil otherwise.
 	NumGoroutines    int
 	MapBufSize       uint64
+	PartitionBufSize int64
 	SkipMapPhase     bool
 	CleanupTmp       bool
 	NumReducers      int
@@ -61,15 +70,26 @@ type options struct {
 	IgnoreErrors     bool
 	CustomTokenizers string
 	NewUids          bool
+	ClientDir        string
+	Encrypted        bool
+	EncryptedOut     bool
 
 	MapShards    int
 	ReduceShards int
 
+	Namespace uint64
+
 	shardOutputDirs []string
+
+	// ........... Badger options ..........
+	// EncryptionKey is the key used for encryption. Enterprise only feature.
+	EncryptionKey x.Sensitive
+	// Badger options.
+	Badger badger.Options
 }
 
 type state struct {
-	opt           options
+	opt           *options
 	prog          *progress
 	xids          *xidmap.XidMap
 	schema        *schemaStore
@@ -77,7 +97,9 @@ type state struct {
 	readerChunkCh chan *bytes.Buffer
 	mapFileId     uint32 // Used atomically to name the output files of the mappers.
 	dbs           []*badger.DB
-	writeTs       uint64 // All badger writes use this timestamp
+	tmpDbs        []*badger.DB // Temporary DB to write the split lists to avoid ordering issues.
+	writeTs       uint64       // All badger writes use this timestamp
+	namespaces    *sync.Map    // To store the encountered namespaces.
 }
 
 type loader struct {
@@ -86,15 +108,26 @@ type loader struct {
 	zero    *grpc.ClientConn
 }
 
-func newLoader(opt options) *loader {
-	fmt.Printf("Connecting to zero at %s\n", opt.ZeroAddr)
+func newLoader(opt *options) *loader {
+	if opt == nil {
+		log.Fatalf("Cannot create loader with nil options.")
+	}
 
+	fmt.Printf("Connecting to zero at %s\n", opt.ZeroAddr)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	zero, err := grpc.DialContext(ctx, opt.ZeroAddr,
+	tlsConf, err := x.LoadClientTLSConfigForInternalPort(Bulk.Conf)
+	x.Check(err)
+	dialOpts := []grpc.DialOption{
 		grpc.WithBlock(),
-		grpc.WithInsecure())
+	}
+	if tlsConf != nil {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConf)))
+	} else {
+		dialOpts = append(dialOpts, grpc.WithInsecure())
+	}
+	zero, err := grpc.DialContext(ctx, opt.ZeroAddr, dialOpts...)
 	x.Checkf(err, "Unable to connect to zero, Is it running at %s?", opt.ZeroAddr)
 	st := &state{
 		opt:    opt,
@@ -103,8 +136,9 @@ func newLoader(opt options) *loader {
 		// Lots of gz readers, so not much channel buffer needed.
 		readerChunkCh: make(chan *bytes.Buffer, opt.NumGoroutines),
 		writeTs:       getWriteTimestamp(zero),
+		namespaces:    &sync.Map{},
 	}
-	st.schema = newSchemaStore(readSchema(opt.SchemaFile), opt, st)
+	st.schema = newSchemaStore(readSchema(opt), opt, st)
 	ld := &loader{
 		state:   st,
 		mappers: make([]*mapper, opt.NumGoroutines),
@@ -131,29 +165,79 @@ func getWriteTimestamp(zero *grpc.ClientConn) uint64 {
 	}
 }
 
-func readSchema(filename string) *schema.ParsedSchema {
-	f, err := os.Open(filename)
+// leaseNamespace is called at the end of map phase. It leases the namespace ids till the maximum
+// seen namespace id.
+func (ld *loader) leaseNamespaces() {
+	var maxNs uint64
+	ld.namespaces.Range(func(key, value interface{}) bool {
+		if ns := key.(uint64); ns > maxNs {
+			maxNs = ns
+		}
+		return true
+	})
+
+	// If only the default namespace is seen, do nothing.
+	if maxNs == 0 {
+		return
+	}
+
+	client := pb.NewZeroClient(ld.zero)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ns, err := client.AssignIds(ctx, &pb.Num{Val: maxNs, Type: pb.Num_NS_ID})
+		cancel()
+		if err == nil {
+			fmt.Printf("Assigned namespaces till %d", ns.GetEndId())
+			return
+		}
+		fmt.Printf("Error communicating with dgraph zero, retrying: %v", err)
+		time.Sleep(time.Second)
+	}
+}
+
+func readSchema(opt *options) *schema.ParsedSchema {
+	f, err := filestore.Open(opt.SchemaFile)
 	x.Check(err)
 	defer f.Close()
-	var r io.Reader = f
-	if filepath.Ext(filename) == ".gz" {
-		r, err = gzip.NewReader(f)
+
+	key := opt.EncryptionKey
+	if !opt.Encrypted {
+		key = nil
+	}
+	r, err := enc.GetReader(key, f)
+	x.Check(err)
+	if filepath.Ext(opt.SchemaFile) == ".gz" {
+		r, err = gzip.NewReader(r)
 		x.Check(err)
 	}
 
 	buf, err := ioutil.ReadAll(r)
 	x.Check(err)
 
-	result, err := schema.Parse(string(buf))
+	result, err := schema.ParseWithNamespace(string(buf), opt.Namespace)
 	x.Check(err)
 	return result
 }
 
 func (ld *loader) mapStage() {
 	ld.prog.setPhase(mapPhase)
-	ld.xids = xidmap.New(ld.zero, nil)
+	var db *badger.DB
+	if len(ld.opt.ClientDir) > 0 {
+		x.Check(os.MkdirAll(ld.opt.ClientDir, 0700))
 
-	files := x.FindDataFiles(ld.opt.DataFiles, []string{".rdf", ".rdf.gz", ".json", ".json.gz"})
+		var err error
+		db, err = badger.Open(badger.DefaultOptions(ld.opt.ClientDir))
+		x.Checkf(err, "Error while creating badger KV posting store")
+	}
+	ld.xids = xidmap.New(xidmap.XidMapOptions{
+		UidAssigner: ld.zero,
+		DB:          db,
+		Dir:         filepath.Join(ld.opt.TmpDir, bufferDir),
+	})
+
+	fs := filestore.NewFileStore(ld.opt.DataFiles)
+
+	files := fs.FindDataFiles(ld.opt.DataFiles, []string{".rdf", ".rdf.gz", ".json", ".json.gz"})
 	if len(files) == 0 {
 		fmt.Printf("No data files found in %s.\n", ld.opt.DataFiles)
 		os.Exit(1)
@@ -187,7 +271,11 @@ func (ld *loader) mapStage() {
 		go func(file string) {
 			defer thr.Done(nil)
 
-			r, cleanup := chunker.FileReader(file)
+			key := ld.opt.EncryptionKey
+			if !ld.opt.Encrypted {
+				key = nil
+			}
+			r, cleanup := fs.ChunkReader(file, key)
 			defer cleanup()
 
 			chunk := chunker.NewChunker(loadType, 1000)
@@ -206,6 +294,9 @@ func (ld *loader) mapStage() {
 	}
 	x.Check(thr.Finish())
 
+	// Send the graphql triples
+	ld.processGqlSchema(loadType)
+
 	close(ld.readerChunkCh)
 	mapperWg.Wait()
 
@@ -214,13 +305,117 @@ func (ld *loader) mapStage() {
 		ld.mappers[i] = nil
 	}
 	x.Check(ld.xids.Flush())
+	if db != nil {
+		x.Check(db.Close())
+	}
 	ld.xids = nil
+}
+
+func parseGqlSchema(s string) map[uint64]string {
+	var schemas []x.ExportedGQLSchema
+	if err := json.Unmarshal([]byte(s), &schemas); err != nil {
+		fmt.Println("Error while decoding the graphql schema. Assuming it to be in format < 21.03.")
+		return map[uint64]string{x.GalaxyNamespace: s}
+	}
+
+	schemaMap := make(map[uint64]string)
+	for _, schema := range schemas {
+		if _, ok := schemaMap[schema.Namespace]; ok {
+			fmt.Printf("Found multiple GraphQL schema for namespace %d.", schema.Namespace)
+			continue
+		}
+		schemaMap[schema.Namespace] = schema.Schema
+	}
+	return schemaMap
+}
+
+func (ld *loader) processGqlSchema(loadType chunker.InputFormat) {
+	if ld.opt.GqlSchemaFile == "" {
+		return
+	}
+
+	f, err := filestore.Open(ld.opt.GqlSchemaFile)
+	x.Check(err)
+	defer f.Close()
+
+	key := ld.opt.EncryptionKey
+	if !ld.opt.Encrypted {
+		key = nil
+	}
+	r, err := enc.GetReader(key, f)
+	x.Check(err)
+	if filepath.Ext(ld.opt.GqlSchemaFile) == ".gz" {
+		r, err = gzip.NewReader(r)
+		x.Check(err)
+	}
+
+	buf, err := ioutil.ReadAll(r)
+	x.Check(err)
+
+	rdfSchema := `_:gqlschema <dgraph.type> "dgraph.graphql" <%#x> .
+	_:gqlschema <dgraph.graphql.xid> "dgraph.graphql.schema" <%#x> .
+	_:gqlschema <dgraph.graphql.schema> %s <%#x> .
+	`
+
+	jsonSchema := `{
+		"namespace": "%#x",
+		"dgraph.type": "dgraph.graphql",
+		"dgraph.graphql.xid": "dgraph.graphql.schema",
+		"dgraph.graphql.schema": %s
+	}`
+
+	process := func(ns uint64, schema string) {
+		// Ignore the schema if the namespace is not already seen.
+		if _, ok := ld.schema.namespaces.Load(ns); !ok {
+			fmt.Printf("No data exist for namespace: %d. Cannot load the graphql schema.", ns)
+			return
+		}
+		gqlBuf := &bytes.Buffer{}
+		schema = strconv.Quote(schema)
+		switch loadType {
+		case chunker.RdfFormat:
+			x.Check2(gqlBuf.Write([]byte(fmt.Sprintf(rdfSchema, ns, ns, schema, ns))))
+		case chunker.JsonFormat:
+			x.Check2(gqlBuf.Write([]byte(fmt.Sprintf(jsonSchema, ns, schema))))
+		}
+		ld.readerChunkCh <- gqlBuf
+	}
+
+	schemas := parseGqlSchema(string(buf))
+	if ld.opt.Namespace == math.MaxUint64 {
+		// Preserve the namespace.
+		for ns, schema := range schemas {
+			process(ns, schema)
+		}
+		return
+	}
+
+	switch len(schemas) {
+	case 1:
+		// User might have exported from a different namespace. So, schema.Namespace will not be
+		// having the correct value.
+		for _, schema := range schemas {
+			process(ld.opt.Namespace, schema)
+		}
+	default:
+		if _, ok := schemas[ld.opt.Namespace]; !ok {
+			// We expect only a single GraphQL schema when loading into specfic namespace.
+			fmt.Printf("Didn't find GraphQL schema for namespace %d. Not loading GraphQL schema.",
+				ld.opt.Namespace)
+			return
+		}
+		process(ld.opt.Namespace, schemas[ld.opt.Namespace])
+	}
+	return
 }
 
 func (ld *loader) reduceStage() {
 	ld.prog.setPhase(reducePhase)
 
-	r := reducer{state: ld.state}
+	r := reducer{
+		state:     ld.state,
+		streamIds: make(map[string]uint32),
+	}
 	x.Check(r.run())
 }
 
@@ -255,6 +450,11 @@ func (ld *loader) writeSchema() {
 func (ld *loader) cleanup() {
 	for _, db := range ld.dbs {
 		x.Check(db.Close())
+	}
+	for _, db := range ld.tmpDbs {
+		opts := db.Opts()
+		x.Check(db.Close())
+		x.Check(os.RemoveAll(opts.Dir))
 	}
 	ld.prog.endSummary()
 }

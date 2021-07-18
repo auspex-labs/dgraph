@@ -13,10 +13,10 @@
 package edgraph
 
 import (
-	"encoding/json"
 	"testing"
 
 	"github.com/dgraph-io/dgraph/ee/acl"
+	"github.com/dgraph-io/dgraph/x"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,24 +27,24 @@ func TestAclCache(t *testing.T) {
 
 	var emptyGroups []string
 	group := "dev"
-	predicate := "friend"
-	require.NoError(t, aclCachePtr.authorizePredicate(emptyGroups, predicate, acl.Read),
-		"the anonymous user should have access when the acl cache is empty")
+	predicate := x.GalaxyAttr("friend")
+	require.Error(t, aclCachePtr.authorizePredicate(emptyGroups, predicate, acl.Read),
+		"the anonymous user should not have access when the acl cache is empty")
 
 	acls := []acl.Acl{
 		{
-			Predicate: predicate,
+			// update operation on acl cache needs predicate without namespace.
+			Predicate: x.ParseAttr(predicate),
 			Perm:      4,
 		},
 	}
-	aclBytes, _ := json.Marshal(acls)
 	groups := []acl.Group{
 		{
 			GroupID: group,
-			Acls:    string(aclBytes),
+			Rules:   acls,
 		},
 	}
-	aclCachePtr.update(groups)
+	aclCachePtr.update(x.GalaxyNamespace, groups)
 	// after a rule is defined, the anonymous user should no longer have access
 	require.Error(t, aclCachePtr.authorizePredicate(emptyGroups, predicate, acl.Read),
 		"the anonymous user should not have access when the predicate has acl defined")
@@ -52,8 +52,8 @@ func TestAclCache(t *testing.T) {
 		"the user with group authorized should have access")
 
 	// update the cache with empty acl list in order to clear the cache
-	aclCachePtr.update([]acl.Group{})
+	aclCachePtr.update(x.GalaxyNamespace, []acl.Group{})
 	// the anonymous user should have access again
-	require.NoError(t, aclCachePtr.authorizePredicate(emptyGroups, predicate, acl.Read),
-		"the anonymous user should have access when the acl cache is empty")
+	require.Error(t, aclCachePtr.authorizePredicate(emptyGroups, predicate, acl.Read),
+		"the anonymous user should not have access when the acl cache is empty")
 }

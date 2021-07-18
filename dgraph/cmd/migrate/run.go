@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Dgraph Labs, Inc. and Contributors
+ * Copyright 2021 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,14 +39,16 @@ var (
 func init() {
 	Migrate.Cmd = &cobra.Command{
 		Use:   "migrate",
-		Short: "Run the Dgraph migrate tool",
+		Short: "Run the Dgraph migration tool from a MySQL database to Dgraph",
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := run(Migrate.Conf); err != nil {
 				logger.Fatalf("%v\n", err)
 			}
 		},
+		Annotations: map[string]string{"group": "tool"},
 	}
 	Migrate.EnvPrefix = "DGRAPH_MIGRATE"
+	Migrate.Cmd.SetHelpTemplate(x.NonRootTemplate)
 
 	flag := Migrate.Cmd.Flags()
 	flag.StringP("user", "", "", "The user for logging in")
@@ -58,6 +60,8 @@ func init() {
 	flag.StringP("output_data", "o", "sql.rdf", "The data output file")
 	flag.StringP("separator", "p", ".", "The separator for constructing predicate names")
 	flag.BoolP("quiet", "q", false, "Enable quiet mode to suppress the warning logs")
+	flag.StringP("host", "", "localhost", "The hostname or IP address of the database server.")
+	flag.StringP("port", "", "3306", "The port of the database server.")
 }
 
 func run(conf *viper.Viper) error {
@@ -67,6 +71,8 @@ func run(conf *viper.Viper) error {
 	tables := conf.GetString("tables")
 	schemaOutput := conf.GetString("output_schema")
 	dataOutput := conf.GetString("output_data")
+	host := conf.GetString("host")
+	port := conf.GetString("port")
 	quiet = conf.GetBool("quiet")
 	separator = conf.GetString("separator")
 
@@ -93,7 +99,7 @@ func run(conf *viper.Viper) error {
 
 	initDataTypes()
 
-	pool, err := getPool(user, db, password)
+	pool, err := getPool(host, port, user, password, db)
 	if err != nil {
 		return err
 	}

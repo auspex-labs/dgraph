@@ -18,13 +18,19 @@
 
 package enc
 
-import "github.com/dgraph-io/dgraph/x"
+import (
+	"io"
+)
 
 // Eebuild indicates if this is a Enterprise build.
 var EeBuild = false
 
-// ReadEncryptionKeyFile returns nil key for OSS build
-func ReadEncryptionKeyFile(filepath string) []byte {
-	x.AssertTruef(filepath == "", "encryption_key_file is an Enterprise only feature.")
-	return nil
+// GetWriter returns the Writer as is for OSS Builds.
+func GetWriter(_ []byte, w io.Writer) (io.Writer, error) {
+	return w, nil
+}
+
+// GetReader returns the reader as is for OSS Builds.
+func GetReader(_ []byte, r io.Reader) (io.Reader, error) {
+	return r, nil
 }

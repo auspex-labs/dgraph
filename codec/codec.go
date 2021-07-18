@@ -17,12 +17,12 @@
 package codec
 
 import (
-	"bytes"
-	"math"
-	"sort"
+	"encoding/binary"
 
 	"github.com/dgraph-io/dgraph/protos/pb"
-	"github.com/dgryski/go-groupvarint"
+	"github.com/dgraph-io/dgraph/x"
+	"github.com/dgraph-io/ristretto/z"
+	"github.com/dgraph-io/sroar"
 )
 
 type seekPos int
@@ -38,293 +38,184 @@ var (
 	bitMask uint64 = 0xffffffff00000000
 )
 
-// Encoder is used to convert a list of UIDs into a pb.UidPack object.
-type Encoder struct {
-	BlockSize int
-	pack      *pb.UidPack
-	uids      []uint64
+//TODO(Ahsan): Need to fix this.
+func ApproxLen(bitmap []byte) int {
+	return 0
 }
 
-func (e *Encoder) packBlock() {
-	if len(e.uids) == 0 {
-		return
-	}
-	block := &pb.UidBlock{Base: e.uids[0], NumUids: uint32(len(e.uids))}
-	last := e.uids[0]
-	e.uids = e.uids[1:]
-
-	var out bytes.Buffer
-	buf := make([]byte, 17)
-	tmpUids := make([]uint32, 4)
-	for {
-		for i := 0; i < 4; i++ {
-			if i >= len(e.uids) {
-				// Padding with '0' because Encode4 encodes only in batch of 4.
-				tmpUids[i] = 0
-			} else {
-				tmpUids[i] = uint32(e.uids[i] - last)
-				last = e.uids[i]
-			}
-		}
-
-		data := groupvarint.Encode4(buf, tmpUids)
-		_, _ = out.Write(data)
-
-		// e.uids has ended and we have padded tmpUids with 0s
-		if len(e.uids) <= 4 {
-			e.uids = e.uids[:0]
-			break
-		}
-		e.uids = e.uids[4:]
-	}
-
-	block.Deltas = out.Bytes()
-	e.pack.Blocks = append(e.pack.Blocks, block)
-}
-
-// Add takes an uid and adds it to the list of UIDs to be encoded.
-func (e *Encoder) Add(uid uint64) {
-	if e.pack == nil {
-		e.pack = &pb.UidPack{BlockSize: uint32(e.BlockSize)}
-	}
-
-	size := len(e.uids)
-	if size > 0 && !match32MSB(e.uids[size-1], uid) {
-		e.packBlock()
-		e.uids = e.uids[:0]
-	}
-
-	e.uids = append(e.uids, uid)
-	if len(e.uids) >= e.BlockSize {
-		e.packBlock()
-		e.uids = e.uids[:0]
+func ToList(rm *sroar.Bitmap) *pb.List {
+	return &pb.List{
+		Bitmap: ToBytes(rm),
 	}
 }
 
-// Done returns the final output of the encoder.
-func (e *Encoder) Done() *pb.UidPack {
-	e.packBlock()
-	return e.pack
-}
-
-// Decoder is used to read a pb.UidPack object back into a list of UIDs.
-type Decoder struct {
-	Pack     *pb.UidPack
-	blockIdx int
-	uids     []uint64
-}
-
-func (d *Decoder) unpackBlock() []uint64 {
-	if len(d.uids) > 0 {
-		// We were previously preallocating the d.uids slice to block size. This caused slowdown
-		// because many blocks are small and only contain a few ints, causing wastage while still
-		// paying cost of allocation.
-		d.uids = d.uids[:0]
+func ToSortedList(rm *sroar.Bitmap) *pb.List {
+	return &pb.List{
+		SortedUids: rm.ToArray(),
 	}
-
-	if d.blockIdx >= len(d.Pack.Blocks) {
-		return d.uids
-	}
-	block := d.Pack.Blocks[d.blockIdx]
-
-	last := block.Base
-	d.uids = append(d.uids, last)
-
-	tmpUids := make([]uint32, 4)
-	var sum uint64
-	encData := block.Deltas
-
-	for uint32(len(d.uids)) < block.NumUids {
-		if len(encData) < 17 {
-			// Decode4 decodes 4 uids from encData. It moves slice(encData) forward while
-			// decoding and expects it to be of length >= 4 at all the stages.
-			// The SSE code tries to read 16 bytes past the header(1 byte).
-			// So we are padding encData to increase its length to 17 bytes.
-			// This is a workaround for https://github.com/dgryski/go-groupvarint/issues/1
-			encData = append(encData, bytes.Repeat([]byte{0}, 17-len(encData))...)
-		}
-
-		groupvarint.Decode4(tmpUids, encData)
-		encData = encData[groupvarint.BytesUsed[encData[0]]:]
-		for i := 0; i < 4; i++ {
-			sum = last + uint64(tmpUids[i])
-			d.uids = append(d.uids, sum)
-			last = sum
-		}
-	}
-
-	d.uids = d.uids[:block.NumUids]
-	return d.uids
 }
 
-// ApproxLen returns the approximate number of UIDs in the pb.UidPack object.
-func (d *Decoder) ApproxLen() int {
-	return int(d.Pack.BlockSize) * (len(d.Pack.Blocks) - d.blockIdx)
+func ListCardinality(l *pb.List) uint64 {
+	if l == nil {
+		return 0
+	}
+	if len(l.SortedUids) > 0 {
+		return uint64(len(l.SortedUids))
+	}
+	b := FromList(l)
+	return uint64(b.GetCardinality())
 }
 
-type searchFunc func(int) bool
+func OneUid(uid uint64) *pb.List {
+	bm := sroar.NewBitmap()
+	bm.Set(uid)
+	return ToList(bm)
+}
 
-// Seek will search for uid in a packed block using the specified whence position.
-// The value of whence must be one of the predefined values SeekStart or SeekCurrent.
-// SeekStart searches uid and includes it as part of the results.
-// SeekCurrent searches uid but only as offset, it won't be included with results.
-//
-// Returns a slice of all uids whence the position, or an empty slice if none found.
-func (d *Decoder) Seek(uid uint64, whence seekPos) []uint64 {
-	if d.Pack == nil {
+func GetUids(l *pb.List) []uint64 {
+	if l == nil {
 		return []uint64{}
 	}
-	d.blockIdx = 0
-	if uid == 0 {
-		return d.unpackBlock()
+	if len(l.SortedUids) > 0 {
+		return l.SortedUids
 	}
-
-	pack := d.Pack
-	blocksFunc := func() searchFunc {
-		var f searchFunc
-		switch whence {
-		case SeekStart:
-			f = func(i int) bool { return pack.Blocks[i].Base >= uid }
-		case SeekCurrent:
-			f = func(i int) bool { return pack.Blocks[i].Base > uid }
-		}
-		return f
-	}
-
-	idx := sort.Search(len(pack.Blocks), blocksFunc())
-	// The first block.Base >= uid.
-	if idx == 0 {
-		return d.unpackBlock()
-	}
-	// The uid is the first entry in the block.
-	if idx < len(pack.Blocks) && pack.Blocks[idx].Base == uid {
-		d.blockIdx = idx
-		return d.unpackBlock()
-	}
-
-	// Either the idx = len(pack.Blocks) that means it wasn't found in any of the block's base. Or,
-	// we found the first block index whose base is greater than uid. In these cases, go to the
-	// previous block and search there.
-	d.blockIdx = idx - 1 // Move to the previous block. If blockIdx<0, unpack will deal with it.
-	d.unpackBlock()      // And get all their uids.
-
-	uidsFunc := func() searchFunc {
-		var f searchFunc
-		switch whence {
-		case SeekStart:
-			f = func(i int) bool { return d.uids[i] >= uid }
-		case SeekCurrent:
-			f = func(i int) bool { return d.uids[i] > uid }
-		}
-		return f
-	}
-
-	// uidx points to the first uid in the uid list, which is >= uid.
-	uidx := sort.Search(len(d.uids), uidsFunc())
-	if uidx < len(d.uids) { // Found an entry in uids, which >= uid.
-		d.uids = d.uids[uidx:]
-		return d.uids
-	}
-	// Could not find any uid in the block, which is >= uid. The next block might still have valid
-	// entries > uid.
-	return d.Next()
+	return FromList(l).ToArray()
 }
 
-// Uids returns all the uids in the pb.UidPack object as an array of integers.
-// uids are owned by the Decoder, and the slice contents would be changed on the next call. They
-// should be copied if passed around.
-func (d *Decoder) Uids() []uint64 {
-	return d.uids
+func SetUids(l *pb.List, uids []uint64) {
+	if len(l.SortedUids) > 0 {
+		l.SortedUids = uids
+	} else {
+		r := sroar.NewBitmap()
+		r.SetMany(uids)
+		l.Bitmap = ToBytes(r)
+	}
 }
 
-// LinearSeek returns uids of the last block whose base is less than seek.
-// If there are no such blocks i.e. seek < base of first block, it returns uids of first
-// block. LinearSeek is used to get closest uids which are >= seek.
-func (d *Decoder) LinearSeek(seek uint64) []uint64 {
-	for {
-		v := d.PeekNextBase()
-		if seek < v {
+func BitmapToSorted(l *pb.List) {
+	if l == nil {
+		return
+	}
+	l.SortedUids = FromList(l).ToArray()
+	l.Bitmap = nil
+}
+
+func And(rm *sroar.Bitmap, l *pb.List) {
+	rl := FromList(l)
+	rm.And(rl)
+}
+
+func MatrixToBitmap(matrix []*pb.List) *sroar.Bitmap {
+	res := sroar.NewBitmap()
+	for _, l := range matrix {
+		r := FromList(l)
+		res.Or(r)
+	}
+	return res
+}
+
+func Intersect(matrix []*pb.List) *sroar.Bitmap {
+	out := sroar.NewBitmap()
+	if len(matrix) == 0 {
+		return out
+	}
+	out.Or(FromList(matrix[0]))
+	for _, l := range matrix[1:] {
+		r := FromList(l)
+		out.And(r)
+	}
+	return out
+}
+
+func Merge(matrix []*pb.List) *sroar.Bitmap {
+	out := sroar.NewBitmap()
+	if len(matrix) == 0 {
+		return out
+	}
+	out.Or(FromList(matrix[0]))
+	for _, l := range matrix[1:] {
+		r := FromList(l)
+		out.Or(r)
+	}
+	return out
+}
+
+func ToBytes(bm *sroar.Bitmap) []byte {
+	if bm.IsEmpty() {
+		return nil
+	}
+	// TODO: We should not use ToBufferWithCopy always.
+	return bm.ToBufferWithCopy()
+}
+
+func FromList(l *pb.List) *sroar.Bitmap {
+	iw := sroar.NewBitmap()
+	if l == nil {
+		return iw
+	}
+	if len(l.SortedUids) > 0 {
+		iw.SetMany(l.SortedUids)
+	}
+	if len(l.Bitmap) > 0 {
+		// TODO: We should not use FromBufferWithCopy always.
+		iw = sroar.FromBufferWithCopy(l.Bitmap)
+	}
+	return iw
+}
+
+func FromBytes(buf []byte) *sroar.Bitmap {
+	r := sroar.NewBitmap()
+	if buf == nil || len(buf) == 0 {
+		return r
+	}
+	return sroar.FromBuffer(buf)
+}
+
+func FromBackup(buf []byte) *sroar.Bitmap {
+	r := sroar.NewBitmap()
+	var prev uint64
+	for len(buf) > 0 {
+		uid, n := binary.Uvarint(buf)
+		if uid == 0 {
 			break
 		}
-		d.blockIdx++
-	}
+		buf = buf[n:]
 
-	return d.unpackBlock()
+		next := prev + uid
+		r.Set(next)
+		prev = next
+	}
+	return r
 }
 
-// PeekNextBase returns the base of the next block without advancing the decoder.
-func (d *Decoder) PeekNextBase() uint64 {
-	bidx := d.blockIdx + 1
-	if bidx < len(d.Pack.Blocks) {
-		return d.Pack.Blocks[bidx].Base
-	}
-	return math.MaxUint64
+func ToUids(plist *pb.PostingList, start uint64) []uint64 {
+	r := sroar.FromBuffer(plist.Bitmap)
+	r.RemoveRange(0, start)
+	return r.ToArray()
 }
 
-// Valid returns true if the decoder has not reached the end of the packed data.
-func (d *Decoder) Valid() bool {
-	return d.blockIdx < len(d.Pack.Blocks)
+// RemoveRange would remove [from, to] from bm.
+func RemoveRange(bm *sroar.Bitmap, from, to uint64) {
+	bm.RemoveRange(from, to)
+	bm.Remove(to)
 }
 
-// Next moves the decoder on to the next block.
-func (d *Decoder) Next() []uint64 {
-	d.blockIdx++
-	return d.unpackBlock()
-}
-
-// Encode takes in a list of uids and a block size. It would pack these uids into blocks of the
-// given size, with the last block having fewer uids. Within each block, it stores the first uid as
-// base. For each next uid, a delta = uids[i] - uids[i-1] is stored. Protobuf uses Varint encoding,
-// as mentioned here: https://developers.google.com/protocol-buffers/docs/encoding . This ensures
-// that the deltas being considerably smaller than the original uids are nicely packed in fewer
-// bytes. Our benchmarks on artificial data show compressed size to be 13% of the original. This
-// mechanism is a LOT simpler to understand and if needed, debug.
-func Encode(uids []uint64, blockSize int) *pb.UidPack {
-	enc := Encoder{BlockSize: blockSize}
-	for _, uid := range uids {
-		enc.Add(uid)
+// DecodeToBuffer is the same as Decode but it returns a z.Buffer which is
+// calloc'ed and can be SHOULD be freed up by calling buffer.Release().
+func DecodeToBuffer(buf *z.Buffer, bm *sroar.Bitmap) {
+	var last uint64
+	tmp := make([]byte, 16)
+	itr := bm.ManyIterator()
+	uids := make([]uint64, 64)
+	for {
+		got := itr.NextMany(uids)
+		if got == 0 {
+			break
+		}
+		for _, u := range uids[:got] {
+			n := binary.PutUvarint(tmp, u-last)
+			x.Check2(buf.Write(tmp[:n]))
+			last = u
+		}
 	}
-	return enc.Done()
-}
-
-// ApproxLen would indicate the total number of UIDs in the pack. Can be used for int slice
-// allocations.
-func ApproxLen(pack *pb.UidPack) int {
-	if pack == nil {
-		return 0
-	}
-	return len(pack.Blocks) * int(pack.BlockSize)
-}
-
-// ExactLen would calculate the total number of UIDs. Instead of using a UidPack, it accepts blocks,
-// so we can calculate the number of uids after a seek.
-func ExactLen(pack *pb.UidPack) int {
-	if pack == nil {
-		return 0
-	}
-	sz := len(pack.Blocks)
-	if sz == 0 {
-		return 0
-	}
-	num := 0
-	for _, b := range pack.Blocks {
-		num += int(b.NumUids) // NumUids includes the base UID.
-	}
-	return num
-}
-
-// Decode decodes the UidPack back into the list of uids. This is a stop-gap function, Decode would
-// need to do more specific things than just return the list back.
-func Decode(pack *pb.UidPack, seek uint64) []uint64 {
-	uids := make([]uint64, 0, ApproxLen(pack))
-	dec := Decoder{Pack: pack}
-
-	for block := dec.Seek(seek, SeekStart); len(block) > 0; block = dec.Next() {
-		uids = append(uids, block...)
-	}
-	return uids
-}
-
-func match32MSB(num1, num2 uint64) bool {
-	return (num1 & bitMask) == (num2 & bitMask)
 }

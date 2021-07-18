@@ -20,16 +20,19 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/dgo/v2"
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/dgo/v210"
+	"github.com/dgraph-io/dgo/v210/protos/api"
 
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
@@ -52,17 +55,27 @@ func commitTs(startTs uint64) uint64 {
 
 func commitTransaction(t *testing.T, edge *pb.DirectedEdge, l *posting.List) {
 	startTs := timestamp()
-	txn := posting.Oracle().RegisterStartTs(startTs)
+	txn, _ := posting.Oracle().RegisterStartTs(startTs)
 	l = txn.Store(l)
 	err := l.AddMutationWithIndex(context.Background(), edge, txn)
 	require.NoError(t, err)
 
 	commit := commitTs(startTs)
 
-	txn.Update()
-	writer := posting.NewTxnWriter(pstore)
-	require.NoError(t, txn.CommitToDisk(writer, commit))
-	require.NoError(t, writer.Flush())
+	txn.Update(context.Background())
+	sl := txn.Skiplist()
+
+	itr := sl.NewUniIterator(false)
+	itr.Rewind()
+	for itr.Valid() {
+		y.SetKeyTs(itr.Key(), commit)
+		itr.Next()
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	pstore.HandoverSkiplist(sl, wg.Done)
+	wg.Wait()
 }
 
 func timestamp() uint64 {
@@ -71,6 +84,11 @@ func timestamp() uint64 {
 
 func addEdge(t *testing.T, edge *pb.DirectedEdge, l *posting.List) {
 	edge.Op = pb.DirectedEdge_SET
+	commitTransaction(t, edge, l)
+}
+
+func delEdge(t *testing.T, edge *pb.DirectedEdge, l *posting.List) {
+	edge.Op = pb.DirectedEdge_DEL
 	commitTransaction(t, edge, l)
 }
 
@@ -86,61 +104,62 @@ func delClusterEdge(t *testing.T, dg *dgo.Dgraph, rdf string) {
 	require.NoError(t, err)
 }
 func getOrCreate(key []byte) *posting.List {
-	l, err := posting.GetNoStore(key)
+	l, err := posting.GetNoStore(key, math.MaxUint64)
 	x.Checkf(err, "While calling posting.Get")
 	return l
 }
 
 func populateGraph(t *testing.T) {
 	// Add uid edges : predicate neightbour.
+	neighbour := x.GalaxyAttr("neighbour")
 	edge := &pb.DirectedEdge{
 		ValueId: 23,
-		Label:   "author0",
-		Attr:    "neighbour",
+		Attr:    neighbour,
 	}
 	edge.Entity = 10
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 10)))
+	addEdge(t, edge, getOrCreate(x.DataKey(neighbour, 10)))
 
 	edge.Entity = 11
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 11)))
+	addEdge(t, edge, getOrCreate(x.DataKey(neighbour, 11)))
 
 	edge.Entity = 12
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 12)))
+	addEdge(t, edge, getOrCreate(x.DataKey(neighbour, 12)))
 
 	edge.ValueId = 25
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 12)))
+	addEdge(t, edge, getOrCreate(x.DataKey(neighbour, 12)))
 
 	edge.ValueId = 26
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 12)))
+	addEdge(t, edge, getOrCreate(x.DataKey(neighbour, 12)))
 
 	edge.Entity = 10
 	edge.ValueId = 31
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 10)))
+	addEdge(t, edge, getOrCreate(x.DataKey(neighbour, 10)))
 
 	edge.Entity = 12
-	addEdge(t, edge, getOrCreate(x.DataKey("neighbour", 12)))
+	addEdge(t, edge, getOrCreate(x.DataKey(neighbour, 12)))
 
 	// add value edges: friend : with name
-	edge.Attr = "friend"
+	friend := x.GalaxyAttr("friend")
+	edge.Attr = neighbour
 	edge.Entity = 12
 	edge.Value = []byte("photon")
 	edge.ValueId = 0
-	addEdge(t, edge, getOrCreate(x.DataKey("friend", 12)))
+	addEdge(t, edge, getOrCreate(x.DataKey(friend, 12)))
 
 	edge.Entity = 10
-	addEdge(t, edge, getOrCreate(x.DataKey("friend", 10)))
+	addEdge(t, edge, getOrCreate(x.DataKey(friend, 10)))
 }
 
 func populateClusterGraph(t *testing.T, dg *dgo.Dgraph) {
 	data1 := [][]int{{10, 23}, {11, 23}, {12, 23}, {12, 25}, {12, 26}, {10, 31}, {12, 31}}
 	for _, pair := range data1 {
-		rdf := fmt.Sprintf(`<0x%x> <neighbour> <0x%x> .`, pair[0], pair[1])
+		rdf := fmt.Sprintf(`<%#x> <neighbour> <%#x> .`, pair[0], pair[1])
 		setClusterEdge(t, dg, rdf)
 	}
 
 	data2 := map[int]string{12: "photon", 10: "photon"}
 	for key, val := range data2 {
-		rdf := fmt.Sprintf(`<0x%x> <friend> %q .`, key, val)
+		rdf := fmt.Sprintf(`<%#x> <friend> %q .`, key, val)
 		setClusterEdge(t, dg, rdf)
 	}
 }
@@ -204,7 +223,7 @@ func runQuery(dg *dgo.Dgraph, attr string, uids []uint64, srcFunc []string) (*ap
 	if uids != nil {
 		var uidv []string
 		for _, uid := range uids {
-			uidv = append(uidv, fmt.Sprintf("0x%x", uid))
+			uidv = append(uidv, fmt.Sprintf("%#x", uid))
 		}
 		query = fmt.Sprintf(`
 			{
@@ -251,8 +270,8 @@ func TestProcessTaskIndexMLayer(t *testing.T) {
 
 	// Now try changing 12's friend value from "photon" to "notphotonExtra" to
 	// "notphoton".
-	setClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 12, "notphotonExtra"))
-	setClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 12, "notphoton"))
+	setClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 12, "notphotonExtra"))
+	setClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 12, "notphoton"))
 
 	// Issue a similar query.
 	resp, err = runQuery(dg, "friend", nil,
@@ -268,12 +287,12 @@ func TestProcessTaskIndexMLayer(t *testing.T) {
 	)
 
 	// Try redundant deletes.
-	delClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 10, "photon"))
-	delClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 10, "photon"))
+	delClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 10, "photon"))
+	delClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 10, "photon"))
 
 	// Delete followed by set.
-	delClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 12, "notphoton"))
-	setClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 12, "ignored"))
+	delClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 12, "notphoton"))
+	setClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 12, "ignored"))
 
 	// Issue a similar query.
 	resp, err = runQuery(dg, "friend", nil,
@@ -317,8 +336,8 @@ func TestProcessTaskIndex(t *testing.T) {
 
 	// Now try changing 12's friend value from "photon" to "notphotonExtra" to
 	// "notphoton".
-	setClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 12, "notphotonExtra"))
-	setClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 12, "notphoton"))
+	setClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 12, "notphotonExtra"))
+	setClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 12, "notphoton"))
 
 	// Issue a similar query.
 	resp, err = runQuery(dg, "friend", nil,
@@ -334,12 +353,12 @@ func TestProcessTaskIndex(t *testing.T) {
 	)
 
 	// Try redundant deletes.
-	delClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 10, "photon"))
-	delClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 10, "photon"))
+	delClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 10, "photon"))
+	delClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 10, "photon"))
 
 	// Delete followed by set.
-	delClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 12, "notphoton"))
-	setClusterEdge(t, dg, fmt.Sprintf("<0x%x> <friend> %q .", 12, "ignored"))
+	delClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 12, "notphoton"))
+	setClusterEdge(t, dg, fmt.Sprintf("<%#x> <friend> %q .", 12, "ignored"))
 
 	// Issue a similar query.
 	resp, err = runQuery(dg, "friend", nil,
@@ -356,18 +375,21 @@ func TestProcessTaskIndex(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	x.Init()
-	posting.Config.AllottedMemory = 1024.0
 	posting.Config.CommitFraction = 0.10
 	gr = new(groupi)
 	gr.gid = 1
 	gr.tablets = make(map[string]*pb.Tablet)
-	gr.tablets["name"] = &pb.Tablet{GroupId: 1}
-	gr.tablets["name2"] = &pb.Tablet{GroupId: 1}
-	gr.tablets["age"] = &pb.Tablet{GroupId: 1}
-	gr.tablets["friend"] = &pb.Tablet{GroupId: 1}
-	gr.tablets["http://www.w3.org/2000/01/rdf-schema#range"] = &pb.Tablet{GroupId: 1}
-	gr.tablets["friend_not_served"] = &pb.Tablet{GroupId: 2}
-	gr.tablets[""] = &pb.Tablet{GroupId: 1}
+	addTablets := func(attrs []string, gid uint32, namespace uint64) {
+		for _, attr := range attrs {
+			gr.tablets[x.NamespaceAttr(namespace, attr)] = &pb.Tablet{GroupId: gid}
+		}
+	}
+
+	addTablets([]string{"name", "name2", "age", "http://www.w3.org/2000/01/rdf-schema#range", "",
+		"friend", "dgraph.type", "dgraph.graphql.xid", "dgraph.graphql.schema"},
+		1, x.GalaxyNamespace)
+	addTablets([]string{"friend_not_served"}, 2, x.GalaxyNamespace)
+	addTablets([]string{"name"}, 1, 0x2)
 
 	dir, err := ioutil.TempDir("", "storetest_")
 	x.Check(err)
@@ -377,7 +399,8 @@ func TestMain(m *testing.M) {
 	ps, err := badger.OpenManaged(opt)
 	x.Check(err)
 	pstore = ps
-	posting.Init(ps)
+	// Not using posting list cache
+	posting.Init(ps, 0)
 	Init(ps)
 
 	os.Exit(m.Run())

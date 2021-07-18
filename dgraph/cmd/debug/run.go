@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Dgraph Labs, Inc. and Contributors
+ * Copyright 2021 Dgraph Labs, Inc. and Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,21 +17,32 @@
 package debug
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"net/http"
+	_ "net/http/pprof"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v3"
+	bpb "github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/ristretto/z"
+	"github.com/dustin/go-humanize"
+
 	"github.com/dgraph-io/dgraph/codec"
+	"github.com/dgraph-io/dgraph/ee"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
+	"github.com/dgraph-io/dgraph/raftwal"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/spf13/cobra"
@@ -46,8 +57,10 @@ var (
 type flagOptions struct {
 	vals          bool
 	keyLookup     string
+	rollupKey     string
 	keyHistory    bool
 	predicate     string
+	prefix        string
 	readOnly      bool
 	pdir          string
 	itemMeta      bool
@@ -55,6 +68,9 @@ type flagOptions struct {
 	readTs        uint64
 	sizeHistogram bool
 	noKeys        bool
+	namespace     uint64
+	key           x.Sensitive
+	onlySummary   bool
 
 	// Options related to the WAL.
 	wdir           string
@@ -69,7 +85,9 @@ func init() {
 		Run: func(cmd *cobra.Command, args []string) {
 			run()
 		},
+		Annotations: map[string]string{"group": "debug"},
 	}
+	Debug.Cmd.SetHelpTemplate(x.NonRootTemplate)
 
 	flag := Debug.Cmd.Flags()
 	flag.BoolVar(&opt.itemMeta, "item", true, "Output item meta as well. Set to false for diffs.")
@@ -78,20 +96,27 @@ func init() {
 		"Ignore key_. Only consider amount when calculating total.")
 	flag.StringVar(&opt.jepsen, "jepsen", "", "Disect Jepsen output. Can be linear/binary.")
 	flag.Uint64Var(&opt.readTs, "at", math.MaxUint64, "Set read timestamp for all txns.")
-	flag.BoolVarP(&opt.readOnly, "readonly", "o", true, "Open in read only mode.")
+	flag.BoolVarP(&opt.readOnly, "readonly", "o", false, "Open in read only mode.")
 	flag.StringVarP(&opt.predicate, "pred", "r", "", "Only output specified predicate.")
+	flag.Uint64VarP(&opt.namespace, "ns", "", 0, "Which namespace to use.")
+	flag.StringVarP(&opt.prefix, "prefix", "", "", "Uses a hex prefix.")
 	flag.StringVarP(&opt.keyLookup, "lookup", "l", "", "Hex of key to lookup.")
+	flag.StringVar(&opt.rollupKey, "rollup", "", "Hex of key to rollup.")
 	flag.BoolVarP(&opt.keyHistory, "history", "y", false, "Show all versions of a key.")
 	flag.StringVarP(&opt.pdir, "postings", "p", "", "Directory where posting lists are stored.")
 	flag.BoolVar(&opt.sizeHistogram, "histogram", false,
 		"Show a histogram of the key and value sizes.")
+	flag.BoolVar(&opt.onlySummary, "only-summary", false,
+		"If true, only show the summary of the p directory.")
 
+	// Flags related to WAL.
 	flag.StringVarP(&opt.wdir, "wal", "w", "", "Directory where Raft write-ahead logs are stored.")
 	flag.Uint64VarP(&opt.wtruncateUntil, "truncate", "t", 0,
 		"Remove data from Raft entries until but not including this index.")
 	flag.StringVarP(&opt.wsetSnapshot, "snap", "s", "",
 		"Set snapshot term,index,readts to this. Value must be comma-separated list containing"+
 			" the value for these vars in that order.")
+	ee.RegisterEncFlag(flag)
 }
 
 func toInt(o *pb.Posting) int {
@@ -121,7 +146,7 @@ func uidToVal(itr *badger.Iterator, prefix string) map[uint64]int {
 		lastKey = append(lastKey[:0], item.Key()...)
 		pk, err := x.Parse(item.Key())
 		x.Check(err)
-		if !pk.IsData() || !strings.HasPrefix(pk.Attr, prefix) {
+		if !pk.IsData() || !strings.HasPrefix(x.ParseAttr(pk.Attr), prefix) {
 			continue
 		}
 		if pk.IsSchema() {
@@ -263,7 +288,8 @@ func showAllPostingsAt(db *badger.DB, readTs uint64) {
 		}
 
 		var acc *account
-		if strings.HasPrefix(pk.Attr, "key_") || strings.HasPrefix(pk.Attr, "amount_") {
+		attr := x.ParseAttr(pk.Attr)
+		if strings.HasPrefix(attr, "key_") || strings.HasPrefix(attr, "amount_") {
 			var has bool
 			acc, has = keys[pk.Uid]
 			if !has {
@@ -285,15 +311,15 @@ func showAllPostingsAt(db *badger.DB, readTs uint64) {
 		}
 		if num > 0 && acc != nil {
 			switch {
-			case strings.HasPrefix(pk.Attr, "key_"):
+			case strings.HasPrefix(attr, "key_"):
 				acc.Key = num
-			case strings.HasPrefix(pk.Attr, "amount_"):
+			case strings.HasPrefix(attr, "amount_"):
 				acc.Amt = num
 			}
 		}
 	}
 	for uid, acc := range keys {
-		fmt.Fprintf(&buf, "Uid: %d %x Key: %d Amount: %d\n", uid, uid, acc.Key, acc.Amt)
+		fmt.Fprintf(&buf, "Uid: %#x Key: %d Amount: %d\n", uid, acc.Key, acc.Amt)
 	}
 	fmt.Println(buf.String())
 }
@@ -395,12 +421,19 @@ func history(lookup []byte, itr *badger.Iterator) {
 				appendPosting(&buf, p)
 			}
 
+			r := codec.FromBytes(plist.Bitmap)
 			fmt.Fprintf(&buf, " Num uids = %d. Size = %d\n",
-				codec.ExactLen(plist.Pack), plist.Pack.Size())
-			dec := codec.Decoder{Pack: plist.Pack}
-			for uids := dec.Seek(0, codec.SeekStart); len(uids) > 0; uids = dec.Next() {
-				for _, uid := range uids {
-					fmt.Fprintf(&buf, " Uid = %d\n", uid)
+				r.GetCardinality(), len(plist.Bitmap))
+
+			itr := r.ManyIterator()
+			uids := make([]uint64, 256)
+			for {
+				num := itr.NextMany(uids)
+				if num == 0 {
+					break
+				}
+				for _, uid := range uids[:num] {
+					fmt.Fprintf(&buf, " Uid = %#x\n", uid)
 				}
 			}
 		}
@@ -410,7 +443,7 @@ func history(lookup []byte, itr *badger.Iterator) {
 }
 
 func appendPosting(w io.Writer, o *pb.Posting) {
-	fmt.Fprintf(w, " Uid: %d Op: %d ", o.Uid, o.Op)
+	fmt.Fprintf(w, " Uid: %#x Op: %d ", o.Uid, o.Op)
 
 	if len(o.Value) > 0 {
 		fmt.Fprintf(w, " Type: %v. ", o.ValType)
@@ -426,6 +459,43 @@ func appendPosting(w io.Writer, o *pb.Posting) {
 		}
 	}
 	fmt.Fprintln(w, "")
+}
+func rollupKey(db *badger.DB) {
+	txn := db.NewTransactionAt(opt.readTs, false)
+	defer txn.Discard()
+
+	key, err := hex.DecodeString(opt.rollupKey)
+	x.Check(err)
+
+	iopts := badger.DefaultIteratorOptions
+	iopts.AllVersions = true
+	iopts.PrefetchValues = false
+	itr := txn.NewKeyIterator(key, iopts)
+	defer itr.Close()
+
+	itr.Rewind()
+	if !itr.Valid() {
+		log.Fatalf("Unable to seek to key: %s", hex.Dump(key))
+	}
+
+	item := itr.Item()
+	// Don't need to do anything if the bitdelta is not set.
+	if item.UserMeta()&posting.BitDeltaPosting == 0 {
+		fmt.Printf("First item has UserMeta:[b%04b]. Nothing to do\n", item.UserMeta())
+		return
+	}
+	pl, err := posting.ReadPostingList(item.KeyCopy(nil), itr)
+	x.Check(err)
+
+	alloc := z.NewAllocator(32<<20, "Debug.RollupKey")
+	defer alloc.Release()
+
+	kvs, err := pl.Rollup(alloc)
+	x.Check(err)
+
+	wb := db.NewManagedWriteBatch()
+	x.Check(wb.WriteList(&bpb.KVList{Kv: kvs}))
+	x.Check(wb.Flush())
 }
 
 func lookup(db *badger.DB) {
@@ -478,28 +548,28 @@ func lookup(db *badger.DB) {
 	fmt.Println(buf.String())
 }
 
+// Current format is like:
+// {i} attr: name term: [8] woods  ts: 535 item: [28, b0100] sz: 81 dcnt: 3 key: 00000...6f6f6473
+// Fix the TestBulkLoadMultiShard accordingly, if the format changes.
 func printKeys(db *badger.DB) {
-	txn := db.NewTransactionAt(opt.readTs, false)
-	defer txn.Discard()
-
-	iopts := badger.DefaultIteratorOptions
-	iopts.PrefetchValues = false
-	itr := txn.NewIterator(iopts)
-	defer itr.Close()
-
 	var prefix []byte
 	if len(opt.predicate) > 0 {
-		prefix = x.PredicatePrefix(opt.predicate)
+		pred := x.NamespaceAttr(opt.namespace, opt.predicate)
+		prefix = x.PredicatePrefix(pred)
+	} else if len(opt.prefix) > 0 {
+		p, err := hex.DecodeString(opt.prefix)
+		x.Check(err)
+		prefix = p
 	}
-
 	fmt.Printf("prefix = %s\n", hex.Dump(prefix))
-	var loop int
-	for itr.Seek(prefix); itr.ValidForPrefix(prefix); itr.Next() {
+	stream := db.NewStreamAt(opt.readTs)
+	stream.Prefix = prefix
+	var total uint64
+	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
 		item := itr.Item()
-		pk, err := x.Parse(item.Key())
+		pk, err := x.Parse(key)
 		x.Check(err)
 		var buf bytes.Buffer
-
 		// Don't use a switch case here. Because multiple of these can be true. In particular,
 		// IsSchema can be true alongside IsData.
 		if pk.IsData() {
@@ -517,124 +587,102 @@ func printKeys(db *badger.DB) {
 		if pk.IsReverse() {
 			x.Check2(buf.WriteString("{r}"))
 		}
-
-		switch {
-		case item.DiscardEarlierVersions():
-			x.Check2(buf.WriteString(" {v.las}"))
-		case item.IsDeletedOrExpired():
-			x.Check2(buf.WriteString(" {v.not}"))
-		default:
-			x.Check2(buf.WriteString(" {v.ok}"))
-		}
-
-		x.Check2(buf.WriteString(" attr: " + pk.Attr))
+		ns, attr := x.ParseNamespaceAttr(pk.Attr)
+		x.Check2(buf.WriteString(fmt.Sprintf(" ns: %#x ", ns)))
+		x.Check2(buf.WriteString(" attr: " + attr))
 		if len(pk.Term) > 0 {
 			fmt.Fprintf(&buf, " term: [%d] %s ", pk.Term[0], pk.Term[1:])
 		}
+		if pk.Count > 0 {
+			fmt.Fprintf(&buf, " count: %d ", pk.Count)
+		}
 		if pk.Uid > 0 {
-			fmt.Fprintf(&buf, " uid: %d ", pk.Uid)
+			fmt.Fprintf(&buf, " uid: %#x ", pk.Uid)
 		}
 		if pk.StartUid > 0 {
-			fmt.Fprintf(&buf, " startUid: %d ", pk.StartUid)
+			fmt.Fprintf(&buf, " startUid: %#x ", pk.StartUid)
 		}
-		fmt.Fprintf(&buf, " key: %s", hex.EncodeToString(item.Key()))
+
 		if opt.itemMeta {
-			fmt.Fprintf(&buf, " item: [%d, b%04b]", item.EstimatedSize(), item.UserMeta())
 			fmt.Fprintf(&buf, " ts: %d", item.Version())
-		}
-		fmt.Println(buf.String())
-		loop++
-	}
-	fmt.Printf("Found %d keys\n", loop)
-}
-
-// Creates bounds for an histogram. The bounds are powers of two of the form
-// [2^min_exponent, ..., 2^max_exponent].
-func getHistogramBounds(minExponent, maxExponent uint32) []float64 {
-	var bounds []float64
-	for i := minExponent; i <= maxExponent; i++ {
-		bounds = append(bounds, float64(int(1)<<i))
-	}
-	return bounds
-}
-
-// HistogramData stores the information needed to represent the sizes of the keys and values
-// as a histogram.
-type HistogramData struct {
-	Bounds         []float64
-	Count          int64
-	CountPerBucket []int64
-	Min            int64
-	Max            int64
-	Sum            int64
-}
-
-// NewHistogramData returns a new instance of HistogramData with properly initialized fields.
-func NewHistogramData(bounds []float64) *HistogramData {
-	return &HistogramData{
-		Bounds:         bounds,
-		CountPerBucket: make([]int64, len(bounds)+1),
-		Max:            0,
-		Min:            math.MaxInt64,
-	}
-}
-
-// Update changes the Min and Max fields if value is less than or greater than the current values.
-func (histogram *HistogramData) Update(value int64) {
-	if value > histogram.Max {
-		histogram.Max = value
-	}
-	if value < histogram.Min {
-		histogram.Min = value
-	}
-
-	histogram.Sum += value
-	histogram.Count++
-
-	for index := 0; index <= len(histogram.Bounds); index++ {
-		// Allocate value in the last buckets if we reached the end of the Bounds array.
-		if index == len(histogram.Bounds) {
-			histogram.CountPerBucket[index]++
-			break
+			fmt.Fprintf(&buf, " item: [%d, b%04b]", item.EstimatedSize(), item.UserMeta())
 		}
 
-		if value < int64(histogram.Bounds[index]) {
-			histogram.CountPerBucket[index]++
-			break
+		var sz, deltaCount int64
+	LOOP:
+		for ; itr.ValidForPrefix(prefix); itr.Next() {
+			item := itr.Item()
+			if !bytes.Equal(item.Key(), key) {
+				break
+			}
+			if item.IsDeletedOrExpired() {
+				x.Check2(buf.WriteString(" {v.del}"))
+				break
+			}
+			switch item.UserMeta() {
+			// This is rather a default case as one of the 4 bit must be set.
+			case posting.BitCompletePosting, posting.BitEmptyPosting, posting.BitSchemaPosting:
+				sz += item.EstimatedSize()
+				break LOOP
+			case posting.BitDeltaPosting:
+				sz += item.EstimatedSize()
+				deltaCount++
+			default:
+				fmt.Printf("No user meta found for key: %s\n", hex.EncodeToString(key))
+			}
+			if item.DiscardEarlierVersions() {
+				x.Check2(buf.WriteString(" {v.las}"))
+				break
+			}
 		}
+		var invalidSz, invalidCount uint64
+		// skip all the versions of key
+		for ; itr.ValidForPrefix(prefix); itr.Next() {
+			item := itr.Item()
+			if !bytes.Equal(item.Key(), key) {
+				break
+			}
+			invalidSz += uint64(item.EstimatedSize())
+			invalidCount++
+		}
+
+		fmt.Fprintf(&buf, " sz: %d dcnt: %d", sz, deltaCount)
+		if invalidCount > 0 {
+			fmt.Fprintf(&buf, " isz: %d icount: %d", invalidSz, invalidCount)
+		}
+		fmt.Fprintf(&buf, " key: %s", hex.EncodeToString(key))
+		// If total size is more than 1 GB or we have more than 1 million keys, flag this key.
+		if uint64(sz)+invalidSz > (1<<30) || uint64(deltaCount)+invalidCount > 10e6 {
+			fmt.Fprintf(&buf, " [HEAVY]")
+		}
+		buf.WriteRune('\n')
+		list := &bpb.KVList{}
+		list.Kv = append(list.Kv, &bpb.KV{
+			Value: buf.Bytes(),
+		})
+		// Don't call fmt.Println here. It is much slower.
+		return list, nil
 	}
-}
 
-// PrintHistogram prints the histogram data in a human-readable format.
-func (histogram HistogramData) PrintHistogram() {
-	fmt.Printf("Min value: %d\n", histogram.Min)
-	fmt.Printf("Max value: %d\n", histogram.Max)
-	fmt.Printf("Mean: %.2f\n", float64(histogram.Sum)/float64(histogram.Count))
-	fmt.Printf("%24s %9s\n", "Range", "Count")
-
-	numBounds := len(histogram.Bounds)
-	for index, count := range histogram.CountPerBucket {
-		if count == 0 {
-			continue
-		}
-
-		// The last bucket represents the bucket that contains the range from
-		// the last bound up to infinity so it's processed differently than the
-		// other buckets.
-		if index == len(histogram.CountPerBucket)-1 {
-			lowerBound := int(histogram.Bounds[numBounds-1])
-			fmt.Printf("[%10d, %10s) %9d\n", lowerBound, "infinity", count)
-			continue
-		}
-
-		upperBound := int(histogram.Bounds[index])
-		lowerBound := 0
-		if index > 0 {
-			lowerBound = int(histogram.Bounds[index-1])
-		}
-
-		fmt.Printf("[%10d, %10d) %9d\n", lowerBound, upperBound, count)
+	w := bufio.NewWriterSize(os.Stdout, 16<<20)
+	stream.Send = func(buf *z.Buffer) error {
+		var count int
+		err := buf.SliceIterate(func(s []byte) error {
+			var kv bpb.KV
+			if err := kv.Unmarshal(s); err != nil {
+				return err
+			}
+			x.Check2(w.Write(kv.Value))
+			count++
+			return nil
+		})
+		atomic.AddUint64(&total, uint64(count))
+		return err
 	}
+	x.Check(stream.Orchestrate(context.Background()))
+	w.Flush()
+	fmt.Println()
+	fmt.Printf("Found %d keys\n", atomic.LoadUint64(&total))
 }
 
 func sizeHistogram(db *badger.DB) {
@@ -648,12 +696,12 @@ func sizeHistogram(db *badger.DB) {
 
 	// Generate distribution bounds. Key sizes are not greater than 2^16 while
 	// value sizes are not greater than 1GB (2^30).
-	keyBounds := getHistogramBounds(5, 16)
-	valueBounds := getHistogramBounds(5, 30)
+	keyBounds := z.HistogramBounds(5, 16)
+	valueBounds := z.HistogramBounds(5, 30)
 
 	// Initialize exporter.
-	keySizeHistogram := NewHistogramData(keyBounds)
-	valueSizeHistogram := NewHistogramData(valueBounds)
+	keySizeHistogram := z.NewHistogramData(keyBounds)
+	valueSizeHistogram := z.NewHistogramData(valueBounds)
 
 	// Collect key and value sizes.
 	var prefix []byte
@@ -672,13 +720,15 @@ func sizeHistogram(db *badger.DB) {
 
 	fmt.Printf("prefix = %s\n", hex.Dump(prefix))
 	fmt.Printf("Found %d keys\n", loop)
-	fmt.Printf("\nHistogram of key sizes (in bytes)\n")
-	keySizeHistogram.PrintHistogram()
-	fmt.Printf("\nHistogram of value sizes (in bytes)\n")
-	valueSizeHistogram.PrintHistogram()
+	fmt.Printf("\nHistogram of key sizes (in bytes) %s\n", keySizeHistogram.String())
+	fmt.Printf("\nHistogram of value sizes (in bytes) %s\n", valueSizeHistogram.String())
 }
 
-func printAlphaProposal(buf *bytes.Buffer, pr pb.Proposal, pending map[uint64]bool) {
+func printAlphaProposal(buf *bytes.Buffer, pr *pb.Proposal, pending map[uint64]bool) {
+	if pr == nil {
+		return
+	}
+
 	switch {
 	case pr.Mutations != nil:
 		fmt.Fprintf(buf, " Mutation . StartTs: %d . Edges: %d .",
@@ -720,7 +770,11 @@ func printAlphaProposal(buf *bytes.Buffer, pr pb.Proposal, pending map[uint64]bo
 	}
 }
 
-func printZeroProposal(buf *bytes.Buffer, zpr pb.ZeroProposal) {
+func printZeroProposal(buf *bytes.Buffer, zpr *pb.ZeroProposal) {
+	if zpr == nil {
+		return
+	}
+
 	switch {
 	case len(zpr.SnapshotTs) > 0:
 		fmt.Fprintf(buf, " Snapshot: %+v .", zpr.SnapshotTs)
@@ -728,8 +782,10 @@ func printZeroProposal(buf *bytes.Buffer, zpr pb.ZeroProposal) {
 		fmt.Fprintf(buf, " Member: %+v .", zpr.Member)
 	case zpr.Tablet != nil:
 		fmt.Fprintf(buf, " Tablet: %+v .", zpr.Tablet)
-	case zpr.MaxLeaseId > 0:
-		fmt.Fprintf(buf, " MaxLeaseId: %d .", zpr.MaxLeaseId)
+	case zpr.MaxUID > 0:
+		fmt.Fprintf(buf, " MaxUID: %d .", zpr.MaxUID)
+	case zpr.MaxNsID > 0:
+		fmt.Fprintf(buf, " MaxNsID: %d .", zpr.MaxNsID)
 	case zpr.MaxRaftId > 0:
 		fmt.Fprintf(buf, " MaxRaftId: %d .", zpr.MaxRaftId)
 	case zpr.MaxTxnTs > 0:
@@ -742,44 +798,109 @@ func printZeroProposal(buf *bytes.Buffer, zpr pb.ZeroProposal) {
 	}
 }
 
+func printSummary(db *badger.DB) {
+	nsFromKey := func(key []byte) uint64 {
+		pk, err := x.Parse(key)
+		if err != nil {
+			// Some of the keys are badger's internal and couldn't be parsed.
+			// Hence, the error is expected in that case.
+			fmt.Printf("Unable to parse key: %#x\n", key)
+			return x.GalaxyNamespace
+		}
+		return x.ParseNamespace(pk.Attr)
+	}
+	banned := db.BannedNamespaces()
+	bannedNs := make(map[uint64]struct{})
+	for _, ns := range banned {
+		bannedNs[ns] = struct{}{}
+	}
+
+	tables := db.Tables()
+	levelSizes := make([]uint64, len(db.Levels()))
+	nsSize := make(map[uint64]uint64)
+	for _, tab := range tables {
+		levelSizes[tab.Level] += uint64(tab.OnDiskSize)
+		if nsFromKey(tab.Left) == nsFromKey(tab.Right) {
+			nsSize[nsFromKey(tab.Left)] += uint64(tab.OnDiskSize)
+		}
+	}
+
+	fmt.Println("[SUMMARY]")
+	totalSize := uint64(0)
+	for i, sz := range levelSizes {
+		fmt.Printf("Level %d size: %12s\n", i, humanize.IBytes(sz))
+		totalSize += sz
+	}
+	fmt.Printf("Total SST size: %12s\n", humanize.IBytes(totalSize))
+	fmt.Println()
+	for ns, sz := range nsSize {
+		fmt.Printf("Namespace %#x size: %12s", ns, humanize.IBytes(sz))
+		if _, ok := bannedNs[ns]; ok {
+			fmt.Printf(" (banned)")
+		}
+		fmt.Println()
+	}
+	fmt.Println()
+}
+
 func run() {
+	go func() {
+		for i := 8080; i < 9080; i++ {
+			fmt.Printf("Listening for /debug HTTP requests at port: %d\n", i)
+			if err := http.ListenAndServe(fmt.Sprintf("localhost:%d", i), nil); err != nil {
+				fmt.Println("Port busy. Trying another one...")
+				continue
+			}
+		}
+	}()
+
 	dir := opt.pdir
 	isWal := false
 	if len(dir) == 0 {
 		dir = opt.wdir
 		isWal = true
 	}
+	keys, err := ee.GetKeys(Debug.Conf)
+	x.Check(err)
+	opt.key = keys.EncKey
+
+	if isWal {
+		store, err := raftwal.InitEncrypted(dir, opt.key)
+		x.Check(err)
+		if err := handleWal(store); err != nil {
+			fmt.Printf("\nGot error while handling WAL: %v\n", err)
+		}
+		return
+	}
+
 	bopts := badger.DefaultOptions(dir).
-		WithTableLoadingMode(options.MemoryMap).
-		WithReadOnly(opt.readOnly)
+		WithReadOnly(opt.readOnly).
+		WithEncryptionKey(opt.key).
+		WithBlockCacheSize(1 << 30).
+		WithIndexCacheSize(1 << 30).
+		WithNamespaceOffset(x.NamespaceOffset) // We don't want to see the banned data.
 
 	x.AssertTruef(len(bopts.Dir) > 0, "No posting or wal dir specified.")
 	fmt.Printf("Opening DB: %s\n", bopts.Dir)
 
-	var db *badger.DB
-	var err error
-	if isWal {
-		db, err = badger.Open(bopts)
-	} else {
-		db, err = badger.OpenManaged(bopts)
-	}
+	db, err := badger.OpenManaged(bopts)
 	x.Check(err)
+	// Not using posting list cache
+	posting.Init(db, 0)
 	defer db.Close()
 
-	if isWal {
-		if err := handleWal(db); err != nil {
-			fmt.Printf("\nGot error while handling WAL: %v\n", err)
-		}
-		fmt.Println("Done")
-		// WAL can't execute the getMinMax function, so we need to deal with it
-		// here, instead of in the select case below.
+	printSummary(db)
+	if opt.onlySummary {
 		return
 	}
 
-	min, max := getMinMax(db, opt.readTs)
-	fmt.Printf("Min commit: %d. Max commit: %d, w.r.t %d\n", min, max, opt.readTs)
+	// Commenting the following out because on large Badger DBs, this can take a LONG time.
+	// min, max := getMinMax(db, opt.readTs)
+	// fmt.Printf("Min commit: %d. Max commit: %d, w.r.t %d\n", min, max, opt.readTs)
 
 	switch {
+	case len(opt.rollupKey) > 0:
+		rollupKey(db)
 	case len(opt.keyLookup) > 0:
 		lookup(db)
 	case len(opt.jepsen) > 0:

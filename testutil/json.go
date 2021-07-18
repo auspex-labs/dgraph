@@ -23,7 +23,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"path"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"testing"
@@ -76,8 +76,10 @@ func DiffJSONMaps(t *testing.T, wantMap, gotMap map[string]interface{},
 		if err != nil {
 			t.Error("Could not marshal JSON:", err)
 		}
-		t.Errorf("Expected JSON and actual JSON differ:\n%s",
-			sdiffJSON(wantBuf, gotBuf, savepath, quiet))
+		if !quiet {
+			t.Errorf("Expected JSON and actual JSON differ:\n%s",
+				sdiffJSON(wantBuf, gotBuf, savepath, quiet))
+		}
 		return false
 	}
 
@@ -105,7 +107,7 @@ func sdiffJSON(wantBuf, gotBuf []byte, savepath string, quiet bool) string {
 	var wantFile, gotFile *os.File
 
 	if savepath != "" {
-		_ = os.MkdirAll(path.Dir(savepath), 0700)
+		_ = os.MkdirAll(filepath.Dir(savepath), 0700)
 		wantFile, _ = os.Create(savepath + ".expected.json")
 		gotFile, _ = os.Create(savepath + ".received.json")
 	} else {

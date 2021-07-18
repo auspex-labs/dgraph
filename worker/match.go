@@ -17,11 +17,10 @@
 package worker
 
 import (
-	"github.com/dgraph-io/dgraph/algo"
 	"github.com/dgraph-io/dgraph/posting"
-	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/tok"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/dgraph-io/sroar"
 )
 
 // LevenshteinDistance measures the difference between two strings.
@@ -32,7 +31,7 @@ import (
 // This implemention is optimized to use O(min(m,n)) space and is based on the
 // optimized C version found here:
 // http://en.wikibooks.org/wiki/Algorithm_implementation/Strings/Levenshtein_distance#C
-func levenshteinDistance(s, t string, max int) int {
+func levenshteinDistance(s, t string) int {
 	if len(s) > len(t) {
 		s, t = t, s
 	}
@@ -43,7 +42,6 @@ func levenshteinDistance(s, t string, max int) int {
 		column[y] = y
 	}
 
-	var minIdx int
 	for x := 1; x <= len(r2); x++ {
 		column[0] = x
 
@@ -55,12 +53,6 @@ func levenshteinDistance(s, t string, max int) int {
 			}
 			column[y] = min(column[y]+1, column[y-1]+1, lastDiag+cost)
 			lastDiag = oldDiag
-		}
-		if minIdx < len(r1) && column[minIdx] > column[minIdx+1] {
-			minIdx++
-		}
-		if column[minIdx] > max {
-			return column[minIdx]
 		}
 	}
 	return column[len(r1)]
@@ -81,21 +73,25 @@ func matchFuzzy(query, val string, max int) bool {
 	if val == "" {
 		return false
 	}
-	return levenshteinDistance(val, query, max) <= max
+	return levenshteinDistance(val, query) <= max
 }
 
 // uidsForMatch collects a list of uids that "might" match a fuzzy term based on the ngram
 // index. matchFuzzy does the actual fuzzy match.
 // Returns the list of uids even if empty, or an error otherwise.
-func uidsForMatch(attr string, arg funcArgs) (*pb.List, error) {
-	opts := posting.ListOptions{ReadTs: arg.q.ReadTs}
-	uidsForNgram := func(ngram string) (*pb.List, error) {
+func uidsForMatch(attr string, arg funcArgs) (*sroar.Bitmap, error) {
+	opts := posting.ListOptions{
+		ReadTs:   arg.q.ReadTs,
+		First:    int(arg.q.First),
+		AfterUid: arg.q.AfterUid,
+	}
+	uidsForNgram := func(ngram string) (*sroar.Bitmap, error) {
 		key := x.IndexKey(attr, ngram)
-		pl, err := posting.GetNoStore(key)
+		pl, err := posting.GetNoStore(key, arg.q.ReadTs)
 		if err != nil {
 			return nil, err
 		}
-		return pl.Uids(opts)
+		return pl.Bitmap(opts)
 	}
 
 	tokens, err := tok.GetTokens(tok.IdentTrigram, arg.srcFn.tokens...)
@@ -103,12 +99,14 @@ func uidsForMatch(attr string, arg funcArgs) (*pb.List, error) {
 		return nil, err
 	}
 
-	uidMatrix := make([]*pb.List, len(tokens))
-	for i, t := range tokens {
-		uidMatrix[i], err = uidsForNgram(t)
+	// TODO: Looks like we're ignoring the "first" argument here. Deal with that.
+	res := sroar.NewBitmap()
+	for _, t := range tokens {
+		bm, err := uidsForNgram(t)
 		if err != nil {
 			return nil, err
 		}
+		res.Or(bm)
 	}
-	return algo.MergeSorted(uidMatrix), nil
+	return res, nil
 }

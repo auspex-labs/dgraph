@@ -56,8 +56,7 @@ func (i Item) Errorf(format string, args ...interface{}) error {
 }
 
 func (i Item) String() string {
-	switch i.Typ {
-	case ItemEOF:
+	if i.Typ == ItemEOF {
 		return "EOF"
 	}
 	return fmt.Sprintf("lex.Item [%v] %q at %d:%d", i.Typ, i.Val, i.line, i.column)
@@ -284,6 +283,19 @@ func (l *Lexer) Peek() rune {
 	r := l.Next()
 	l.Backup()
 	return r
+}
+
+// Peek returns the next two rune without advancing the lexer.
+func (l *Lexer) PeekTwo() []rune {
+	r1 := l.Next()
+	if r1 == EOF {
+		l.Backup()
+		return []rune{r1, EOF}
+	}
+	r2 := l.Next()
+	l.Backup()
+	l.Backup()
+	return []rune{r1, r2}
 }
 
 func (l *Lexer) moveStartToPos() {

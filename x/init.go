@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/golang/glog"
 )
 
@@ -33,6 +35,7 @@ var (
 
 	// These variables are set using -ldflags
 	dgraphVersion  string
+	dgraphCodename string
 	gitBranch      string
 	lastCommitSHA  string
 	lastCommitTime string
@@ -58,7 +61,9 @@ func AddInit(f func()) {
 // Init initializes flags and run all functions in initFunc.
 func Init() {
 	// Default value, would be overwritten by flag.
-	Config.QueryEdgeLimit = 1e6
+	//
+	// TODO: why is this here?
+	// Config.QueryEdgeLimit = 1e6
 
 	// Next, run all the init functions that have been added.
 	for _, f := range initFunc {
@@ -73,24 +78,31 @@ func BuildDetails() string {
 		licenseInfo = "Licensed variously under the Apache Public License 2.0 and Dgraph " +
 			"Community License"
 	}
+
+	buf := z.CallocNoRef(1, "X.BuildDetails")
+	jem := len(buf) > 0
+	z.Free(buf)
+
 	return fmt.Sprintf(`
 Dgraph version   : %v
+Dgraph codename  : %v
 Dgraph SHA-256   : %x
 Commit SHA-1     : %v
 Commit timestamp : %v
 Branch           : %v
 Go version       : %v
+jemalloc enabled : %v
 
-For Dgraph official documentation, visit https://docs.dgraph.io.
+For Dgraph official documentation, visit https://dgraph.io/docs.
 For discussions about Dgraph     , visit https://discuss.dgraph.io.
-To say hi to the community       , visit https://dgraph.slack.com.
+For fully-managed Dgraph Cloud   , visit https://dgraph.io/cloud.
 
 %s.
-Copyright 2015-2018 Dgraph Labs, Inc.
+Copyright 2015-2021 Dgraph Labs, Inc.
 
 `,
-		dgraphVersion, ExecutableChecksum(), lastCommitSHA, lastCommitTime, gitBranch,
-		runtime.Version(), licenseInfo)
+		dgraphVersion, dgraphCodename, ExecutableChecksum(), lastCommitSHA, lastCommitTime, gitBranch,
+		runtime.Version(), jem, licenseInfo)
 }
 
 // PrintVersion prints version and other helpful information if --version.
@@ -101,6 +113,17 @@ func PrintVersion() {
 // Version returns a string containing the dgraphVersion.
 func Version() string {
 	return dgraphVersion
+}
+
+// pattern for  dev version = min. 7 hex digits of commit-hash.
+var versionRe *regexp.Regexp = regexp.MustCompile(`-g[[:xdigit:]]{7,}`)
+
+// DevVersion returns true if the version string contains the above pattern
+// e.g.
+//  1. v2.0.0-rc1-127-gd20a768b3 => dev version
+//  2. v2.0.0 => prod version
+func DevVersion() (matched bool) {
+	return (versionRe.MatchString(dgraphVersion))
 }
 
 // ExecutableChecksum returns a byte slice containing the SHA256 checksum of the executable.

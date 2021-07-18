@@ -17,69 +17,73 @@
 package posting
 
 import (
+	"math"
 	"testing"
 
+	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/stretchr/testify/require"
 )
 
 func TestRollupTimestamp(t *testing.T) {
-	key := x.DataKey("rollup", 1)
+	attr := x.GalaxyAttr("rollup")
+	key := x.DataKey(attr, 1)
 	// 3 Delta commits.
-	addEdgeToUID(t, "rollup", 1, 2, 1, 2)
-	addEdgeToUID(t, "rollup", 1, 3, 3, 4)
-	addEdgeToUID(t, "rollup", 1, 4, 5, 6)
+	addEdgeToUID(t, attr, 1, 2, 1, 2)
+	addEdgeToUID(t, attr, 1, 3, 3, 4)
+	addEdgeToUID(t, attr, 1, 4, 5, 6)
 
-	l, err := GetNoStore(key)
+	l, err := GetNoStore(key, math.MaxUint64)
 	require.NoError(t, err)
 
 	uidList, err := l.Uids(ListOptions{ReadTs: 7})
 	require.NoError(t, err)
-	require.Equal(t, 3, len(uidList.Uids))
+	require.Equal(t, uint64(3), codec.ListCardinality(uidList))
 
 	edge := &pb.DirectedEdge{
 		Entity: 1,
-		Attr:   "rollup",
+		Attr:   attr,
 		Value:  []byte(x.Star),
 		Op:     pb.DirectedEdge_DEL,
 	}
 	addMutation(t, l, edge, Del, 9, 10, false)
 
-	nl, err := getNew(key, pstore)
+	nl, err := getNew(key, pstore, math.MaxUint64)
 	require.NoError(t, err)
 
 	uidList, err = nl.Uids(ListOptions{ReadTs: 11})
 	require.NoError(t, err)
-	require.Equal(t, 0, len(uidList.Uids))
+	require.Equal(t, uint64(0), codec.ListCardinality(uidList))
 
 	// Now check that we don't lost the highest version during a rollup operation, despite the STAR
 	// delete marker being the most recent update.
-	kvs, err := nl.Rollup()
+	kvs, err := nl.Rollup(nil)
 	require.NoError(t, err)
 	require.Equal(t, uint64(10), kvs[0].Version)
 }
 
 func TestPostingListRead(t *testing.T) {
-	key := x.DataKey("emptypl", 1)
+	attr := x.GalaxyAttr("emptypl")
+	key := x.DataKey(attr, 1)
 
 	assertLength := func(readTs, sz int) {
-		nl, err := getNew(key, pstore)
+		nl, err := getNew(key, pstore, math.MaxUint64)
 		require.NoError(t, err)
 		uidList, err := nl.Uids(ListOptions{ReadTs: uint64(readTs)})
 		require.NoError(t, err)
-		require.Equal(t, sz, len(uidList.Uids))
+		require.Equal(t, uint64(sz), codec.ListCardinality(uidList))
 	}
 
-	addEdgeToUID(t, "emptypl", 1, 2, 1, 2)
-	addEdgeToUID(t, "emptypl", 1, 3, 3, 4)
+	addEdgeToUID(t, attr, 1, 2, 1, 2)
+	addEdgeToUID(t, attr, 1, 3, 3, 4)
 
 	writer := NewTxnWriter(pstore)
 	require.NoError(t, writer.SetAt(key, []byte{}, BitEmptyPosting, 6))
 	require.NoError(t, writer.Flush())
 	assertLength(7, 0)
 
-	addEdgeToUID(t, "emptypl", 1, 4, 7, 8)
+	addEdgeToUID(t, attr, 1, 4, 7, 8)
 	assertLength(9, 1)
 
 	var empty pb.PostingList
@@ -91,8 +95,8 @@ func TestPostingListRead(t *testing.T) {
 	require.NoError(t, writer.Flush())
 	assertLength(10, 0)
 
-	addEdgeToUID(t, "emptypl", 1, 5, 11, 12)
-	addEdgeToUID(t, "emptypl", 1, 6, 13, 14)
-	addEdgeToUID(t, "emptypl", 1, 7, 15, 16)
+	addEdgeToUID(t, attr, 1, 5, 11, 12)
+	addEdgeToUID(t, attr, 1, 6, 13, 14)
+	addEdgeToUID(t, attr, 1, 7, 15, 16)
 	assertLength(17, 3)
 }

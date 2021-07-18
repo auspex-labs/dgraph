@@ -18,8 +18,13 @@ package query
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 
+	"github.com/dgraph-io/dgo/v210/protos/api"
+	"github.com/dgraph-io/dgraph/x"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,7 +34,7 @@ func TestBigMathValue(t *testing.T) {
 	triples := `
 		_:user1 <money> "48038396025285290" .
 	`
-	addTriplesToCluster(triples)
+	require.NoError(t, addTriplesToCluster(triples))
 
 	t.Run("div", func(t *testing.T) {
 		q1 := `
@@ -131,7 +136,7 @@ func TestFloatConverstion(t *testing.T) {
 
 }
 
-func TestDeleteAndReaddIndex(t *testing.T) {
+func TestDeleteAndReadIndex(t *testing.T) {
 	// Add new predicate with several indices.
 	s1 := testSchema + "\n numerology: string @index(exact, term, fulltext) .\n"
 	setSchema(s1)
@@ -139,7 +144,7 @@ func TestDeleteAndReaddIndex(t *testing.T) {
 		<0x666> <numerology> "This number is evil"  .
 		<0x777> <numerology> "This number is good"  .
 	`
-	addTriplesToCluster(triples)
+	require.NoError(t, addTriplesToCluster(triples))
 
 	// Verify fulltext index works as expected.
 	q1 := `
@@ -189,7 +194,7 @@ func TestDeleteAndReaddIndex(t *testing.T) {
 	setSchema(testSchema)
 }
 
-func TestDeleteAndReaddCount(t *testing.T) {
+func TestDeleteAndReadCount(t *testing.T) {
 	// Add new predicate with count index.
 	s1 := testSchema + "\n numerology: string @count .\n"
 	setSchema(s1)
@@ -197,7 +202,7 @@ func TestDeleteAndReaddCount(t *testing.T) {
 		<0x666> <numerology> "This number is evil"  .
 		<0x777> <numerology> "This number is good"  .
 	`
-	addTriplesToCluster(triples)
+	require.NoError(t, addTriplesToCluster(triples))
 
 	// Verify count index works as expected.
 	q1 := `
@@ -233,12 +238,12 @@ func TestDeleteAndReaddCount(t *testing.T) {
 	setSchema(testSchema)
 }
 
-func TestDeleteAndReaddReverse(t *testing.T) {
+func TestDeleteAndReadReverse(t *testing.T) {
 	// Add new predicate with a reverse edge.
 	s1 := testSchema + "\n child_pred: uid @reverse .\n"
 	setSchema(s1)
 	triples := `<0x666> <child_pred> <0x777>  .`
-	addTriplesToCluster(triples)
+	require.NoError(t, addTriplesToCluster(triples))
 
 	// Verify reverse edges works as expected.
 	q1 := `
@@ -269,6 +274,153 @@ func TestDeleteAndReaddReverse(t *testing.T) {
 	setSchema(testSchema)
 }
 
+func TestSchemaUpdateNoConflict(t *testing.T) {
+	// Verify schema is as expected for the predicate with noconflict directive.
+	q1 := `schema(pred: [noconflict_pred]) { }`
+	js := processQueryNoErr(t, q1)
+	require.JSONEq(t, `{
+		"data": {
+			"schema": [{
+				"predicate": "noconflict_pred",
+				"type": "string",
+				"no_conflict": true
+			}]
+		}
+	}`, js)
+
+	// Verify schema is as expected for the predicate without noconflict directive.
+	q1 = `schema(pred: [name]) { }`
+	js = processQueryNoErr(t, q1)
+	require.JSONEq(t, `{
+		"data": {
+			"schema": [{
+				"predicate": "name",
+				"type": "string",
+				"index": true,
+				"tokenizer": ["term", "exact", "trigram"],
+				"count": true,
+				"lang": true
+			}]
+		}
+	}`, js)
+}
+
+func TestNoConflictQuery1(t *testing.T) {
+	schema := `
+		type node {
+		name_noconflict: string
+		child: uid
+		}
+
+		name_noconflict: string @noconflict .
+		child: uid .
+	`
+	setSchema(schema)
+
+	type node struct {
+		ID    string `json:"uid"`
+		Name  string `json:"name_noconflict"`
+		Child *node  `json:"child"`
+	}
+
+	child := node{ID: "_:blank-0", Name: "child"}
+	js, err := json.Marshal(child)
+	require.NoError(t, err)
+
+	res, err := client.NewTxn().Mutate(context.Background(),
+		&api.Mutation{SetJson: js, CommitNow: true})
+	require.NoError(t, err)
+
+	in := []node{}
+	for i := 0; i < 5; i++ {
+		in = append(in, node{ID: "_:blank-0", Name: fmt.Sprintf("%d", i+1),
+			Child: &node{ID: res.GetUids()["blank-0"]}})
+	}
+
+	errChan := make(chan error)
+	for i := range in {
+		go func(n node) {
+			js, err := json.Marshal(n)
+			require.NoError(t, err)
+
+			_, err = client.NewTxn().Mutate(context.Background(),
+				&api.Mutation{SetJson: js, CommitNow: true})
+			errChan <- err
+		}(in[i])
+	}
+
+	errs := []error{}
+	for i := 0; i < len(in); i++ {
+		errs = append(errs, <-errChan)
+	}
+
+	for _, e := range errs {
+		assert.NoError(t, e)
+	}
+}
+
+func TestNoConflictQuery2(t *testing.T) {
+	schema := `
+		type node {
+		name_noconflict: string
+		address_conflict: string
+		child: uid
+		}
+
+		name_noconflict: string @noconflict .
+		address_conflict: string .
+		child: uid .
+	`
+	setSchema(schema)
+
+	type node struct {
+		ID      string `json:"uid"`
+		Name    string `json:"name_noconflict"`
+		Child   *node  `json:"child"`
+		Address string `json:"address_conflict"`
+	}
+
+	child := node{ID: "_:blank-0", Name: "child", Address: "dgraph labs"}
+	js, err := json.Marshal(child)
+	require.NoError(t, err)
+
+	res, err := client.NewTxn().Mutate(context.Background(),
+		&api.Mutation{SetJson: js, CommitNow: true})
+	require.NoError(t, err)
+
+	in := []node{}
+	for i := 0; i < 5; i++ {
+		in = append(in, node{ID: "_:blank-0", Name: fmt.Sprintf("%d", i+1),
+			Child: &node{ID: res.GetUids()["blank-0"]}})
+	}
+
+	errChan := make(chan error)
+	for i := range in {
+		go func(n node) {
+			js, err := json.Marshal(n)
+			require.NoError(t, err)
+
+			_, err = client.NewTxn().Mutate(context.Background(),
+				&api.Mutation{SetJson: js, CommitNow: true})
+			errChan <- err
+		}(in[i])
+	}
+
+	errs := []error{}
+	for i := 0; i < len(in); i++ {
+		errs = append(errs, <-errChan)
+	}
+
+	hasError := false
+	for _, e := range errs {
+		if e != nil {
+			hasError = true
+			require.Contains(t, e.Error(), "Transaction has been aborted. Please retry")
+		}
+	}
+	x.AssertTrue(hasError)
+}
+
 func TestDropPredicate(t *testing.T) {
 	// Add new predicate with several indices.
 	s1 := testSchema + "\n numerology: string @index(term) .\n"
@@ -277,7 +429,7 @@ func TestDropPredicate(t *testing.T) {
 		<0x666> <numerology> "This number is evil"  .
 		<0x777> <numerology> "This number is good"  .
 	`
-	addTriplesToCluster(triples)
+	require.NoError(t, addTriplesToCluster(triples))
 
 	// Verify queries work as expected.
 	q1 := `
@@ -471,6 +623,20 @@ func TestTypeFilterAtExpandEmptyResults(t *testing.T) {
 	require.JSONEq(t, `{"data": {"q":[]}}`, js)
 }
 
+func TestFilterAtSameLevelOnUIDWithExpand(t *testing.T) {
+	query := `{
+		q(func: eq(name, "Michonne")) {
+			expand(_all_)
+			friend @filter(eq(alive, true)){
+				expand(_all_)
+			}
+		}
+	}`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data":{"q":[{"name":"Michonne","gender":"female","alive":true,
+	"friend":[{"gender":"male","alive":true,"name":"Rick Grimes"}]}]}}`, js)
+}
+
 // Test Related to worker based pagination.
 
 func TestHasOrderDesc(t *testing.T) {
@@ -484,19 +650,19 @@ func TestHasOrderDesc(t *testing.T) {
 		"data": {
 			"q": [
 			  {
-				"name": ""
-			  },
-			  {
-				"name": ""
-			  },
-			  {
-				"name": "Badger"
-			  },
-			  {
 				"name": "name"
 			  },
 			  {
 				"name": "expand"
+			  },
+			  {
+				"name": "Shoreline Amphitheater"
+			  },
+			  {
+				"name": "School B"
+			  },
+			  {
+				"name": "School A"
 			  }
 			]
 		  }
@@ -513,19 +679,19 @@ func TestHasOrderDescOffset(t *testing.T) {
 		"data": {
 			"q": [
 			  {
-				"name": "Shoreline Amphitheater"
-			  },
-			  {
-				"name": "School B"
-			  },
-			  {
-				"name": "School A"
-			  },
-			  {
 				"name": "San Mateo School District"
 			  },
 			  {
 				"name": "San Mateo High School"
+			  },
+			  {
+				"name": "San Mateo County"
+			  },
+			  {
+				"name": "San Carlos Airport"
+			  },
+			  {
+				"name": "San Carlos"
 			  }
 			]
 		  }
@@ -1393,4 +1559,5 @@ func TestNumUids(t *testing.T) {
 	metrics := processQueryForMetrics(t, query)
 	require.Equal(t, metrics.NumUids["friend"], uint64(10))
 	require.Equal(t, metrics.NumUids["name"], uint64(16))
+	require.Equal(t, metrics.NumUids["_total"], uint64(26))
 }

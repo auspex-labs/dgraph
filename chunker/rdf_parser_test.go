@@ -19,7 +19,7 @@ package chunker
 import (
 	"testing"
 
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v210/protos/api"
 	"github.com/dgraph-io/dgraph/lex"
 	"github.com/dgraph-io/dgraph/types/facets"
 	"github.com/dgraph-io/dgraph/x"
@@ -145,6 +145,15 @@ var testNQuads = []struct {
 	},
 	{
 		input: `_:alice <age> "013"^^<xs:int> .`,
+		nq: api.NQuad{
+			Subject:     "_:alice",
+			Predicate:   "age",
+			ObjectId:    "",
+			ObjectValue: &api.Value{Val: &api.Value_IntVal{IntVal: 13}},
+		},
+	},
+	{
+		input: `_:alice <age> "013"^^<xs:integer> .`,
 		nq: api.NQuad{
 			Subject:     "_:alice",
 			Predicate:   "age",
@@ -337,40 +346,40 @@ var testNQuads = []struct {
 		expectedErr: false,
 	},
 	{
-		input: `_:alice <knows> "stuff"^^<xs:string> <label> .`,
+		input: `_:alice <knows> "stuff"^^<xs:string> <0xf2> .`,
 		nq: api.NQuad{
 			Subject:     "_:alice",
 			Predicate:   "knows",
 			ObjectId:    "",
 			ObjectValue: &api.Value{Val: &api.Value_StrVal{StrVal: "stuff"}},
-			Label:       "label",
+			Namespace:   0xf2,
 		},
 		expectedErr: false,
 	},
 	{
-		input: `_:alice <knows> "stuff"^^<xs:string> _:label .`,
+		input: `_:alice <knows> "stuff"^^<xs:string> <0xf2> .`,
 		nq: api.NQuad{
 			Subject:     "_:alice",
 			Predicate:   "knows",
 			ObjectId:    "",
 			ObjectValue: &api.Value{Val: &api.Value_StrVal{StrVal: "stuff"}},
-			Label:       "_:label",
+			Namespace:   0xf2,
 		},
 		expectedErr: false,
 	},
 	{
-		input: `_:alice <knows> "stuff"^^<xs:string> _:label . # comment`,
+		input: `_:alice <knows> "stuff"^^<xs:string> <10> . # comment`,
 		nq: api.NQuad{
 			Subject:     "_:alice",
 			Predicate:   "knows",
 			ObjectId:    "",
 			ObjectValue: &api.Value{Val: &api.Value_StrVal{StrVal: "stuff"}},
-			Label:       "_:label",
+			Namespace:   10,
 		},
 		expectedErr: false,
 	},
 	{
-		input:       `_:alice <knows> "stuff"^^<xs:string> "label" .`,
+		input:       `_:alice <knows> "stuff"^^<xs:string> "0xf2" .`,
 		expectedErr: true,
 	},
 	{
@@ -590,13 +599,13 @@ var testNQuads = []struct {
 
 	// Edge Facets test.
 	{
-		input: `_:alice <knows> "stuff" _:label (key1="val1",key2=13) .`,
+		input: `_:alice <knows> "stuff" <0x10> (key1="val1",key2=13) .`,
 		nq: api.NQuad{
 			Subject:     "_:alice",
 			Predicate:   "knows",
 			ObjectId:    "",
 			ObjectValue: &api.Value{Val: &api.Value_DefaultVal{DefaultVal: "stuff"}},
-			Label:       "_:label",
+			Namespace:   0x10,
 			Facets: []*api.Facet{
 				{
 					Key:     "key1",
@@ -614,13 +623,13 @@ var testNQuads = []struct {
 		expectedErr: false,
 	},
 	{
-		input: `_:alice <knows> "stuff" _:label (key1=,key2=13) .`,
+		input: `_:alice <knows> "stuff" <0x12> (key1=,key2=13) .`,
 		nq: api.NQuad{
 			Subject:     "_:alice",
 			Predicate:   "knows",
 			ObjectId:    "",
 			ObjectValue: &api.Value{Val: &api.Value_DefaultVal{DefaultVal: "stuff"}},
-			Label:       "_:label",
+			Namespace:   0x12,
 			Facets: []*api.Facet{
 				{
 					Key:     "key1",
@@ -1000,13 +1009,14 @@ func TestLex(t *testing.T) {
 	for _, test := range testNQuads {
 		l.Reset(test.input)
 		rnq, err := ParseRDF(test.input, l)
-		if test.expectedErr && test.shouldIgnore {
+		switch {
+		case test.expectedErr && test.shouldIgnore:
 			require.Equal(t, ErrEmpty, err, "Catch an ignorable case: %v",
 				err.Error())
-		} else if test.expectedErr {
+		case test.expectedErr:
 			require.Error(t, err, "Expected error for input: %q. Output: %+v",
 				test.input, rnq)
-		} else {
+		default:
 			require.NoError(t, err, "Got error for input: %q", test.input)
 			require.Equal(t, test.nq, rnq, "Mismatch for input: %q", test.input)
 		}

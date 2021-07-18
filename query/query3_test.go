@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dgraph-io/dgraph/testutil"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/metadata"
 )
@@ -335,9 +336,30 @@ func TestKShortestPathWeighted(t *testing.T) {
 		}`
 	// We only get one path in this case as the facet is present only in one path.
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"_path_":[{"uid":"0x1","_weight_":0.3,"path":{"uid":"0x1f","path":{"uid":"0x3e8","path":{"uid":"0x3e9","path|weight":0.100000},"path|weight":0.100000},"path|weight":0.100000}}]}}`,
-		js)
+	require.JSONEq(t, `
+		{
+		  "data": {
+		    "_path_": [
+		      {
+		        "path": {
+		          "path": {
+		            "path": {
+		              "uid": "0x3e9",
+		              "path|weight": 0.1
+		            },
+		            "uid": "0x3e8",
+		            "path|weight": 0.1
+		          },
+		          "uid": "0x1f",
+		          "path|weight": 0.1
+		        },
+		        "uid": "0x1",
+		        "_weight_": 0.3
+		      }
+		    ]
+		  }
+		}
+	`, js)
 }
 
 func TestKShortestPathWeightedMinMaxNoEffect(t *testing.T) {
@@ -351,9 +373,30 @@ func TestKShortestPathWeightedMinMaxNoEffect(t *testing.T) {
 	// We only get one path in this case as the facet is present only in one path.
 	// The path meets the weight requirements so it does not get filtered.
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"_path_":[{"uid":"0x1","_weight_":0.3,"path":{"uid":"0x1f","path":{"uid":"0x3e8","path":{"uid":"0x3e9","path|weight":0.100000},"path|weight":0.100000},"path|weight":0.100000}}]}}`,
-		js)
+	require.JSONEq(t, `
+		{
+		  "data": {
+		    "_path_": [
+		      {
+		        "path": {
+		          "path": {
+		            "path": {
+		              "uid": "0x3e9",
+		              "path|weight": 0.1
+		            },
+		            "uid": "0x3e8",
+		            "path|weight": 0.1
+		          },
+		          "uid": "0x1f",
+		          "path|weight": 0.1
+		        },
+		        "uid": "0x1",
+		        "_weight_": 0.3
+		      }
+		    ]
+		  }
+		}
+	`, js)
 }
 
 func TestKShortestPathWeightedMinWeight(t *testing.T) {
@@ -406,12 +449,78 @@ func TestKShortestPathWeighted1(t *testing.T) {
 			}
 		}`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"_path_":[
-			{"uid":"0x1","_weight_":1,"path":{"uid":"0x1f","path":{"uid":"0x3e8","path":{"uid":"0x3e9","path":{"uid":"0x3ea","path":{"uid":"0x3eb","path|weight":0.600000},"path|weight":0.100000},"path|weight":0.100000},"path|weight":0.100000},"path|weight":0.100000}},
-			{"uid":"0x1","_weight_":1.5,"path":{"uid":"0x1f","path":{"uid":"0x3e8","path":{"uid":"0x3ea","path":{"uid":"0x3eb","path|weight":0.600000},"path|weight":0.700000},"path|weight":0.100000},"path|weight":0.100000}},
-			{"uid":"0x1","_weight_":1.8,"path":{"uid":"0x1f","path":{"uid":"0x3e8","path":{"uid":"0x3e9","path":{"uid":"0x3eb","path|weight":1.500000},"path|weight":0.100000},"path|weight":0.100000},"path|weight":0.100000}}]}}`,
-		js)
+	require.JSONEq(t, `
+		{
+		  "data": {
+		    "_path_": [
+		      {
+		        "path": {
+		          "path": {
+		            "path": {
+		              "path": {
+		                "path": {
+		                  "uid": "0x3eb",
+		                  "path|weight": 0.6
+		                },
+		                "uid": "0x3ea",
+		                "path|weight": 0.1
+		              },
+		              "uid": "0x3e9",
+		              "path|weight": 0.1
+		            },
+		            "uid": "0x3e8",
+		            "path|weight": 0.1
+		          },
+		          "uid": "0x1f",
+		          "path|weight": 0.1
+		        },
+		        "uid": "0x1",
+		        "_weight_": 1
+		      },
+		      {
+		        "path": {
+		          "path": {
+		            "path": {
+		              "path": {
+		                "uid": "0x3eb",
+		                "path|weight": 0.6
+		              },
+		              "uid": "0x3ea",
+		              "path|weight": 0.7
+		            },
+		            "uid": "0x3e8",
+		            "path|weight": 0.1
+		          },
+		          "uid": "0x1f",
+		          "path|weight": 0.1
+		        },
+		        "uid": "0x1",
+		        "_weight_": 1.5
+		      },
+		      {
+		        "path": {
+		          "path": {
+		            "path": {
+		              "path": {
+		                "uid": "0x3eb",
+		                "path|weight": 1.5
+		              },
+		              "uid": "0x3e9",
+		              "path|weight": 0.1
+		            },
+		            "uid": "0x3e8",
+		            "path|weight": 0.1
+		          },
+		          "uid": "0x1f",
+		          "path|weight": 0.1
+		        },
+		        "uid": "0x1",
+		        "_weight_": 1.8
+		      }
+		    ]
+		  }
+		}
+	`, js)
 }
 
 func TestKShortestPathWeighted1MinMaxWeight(t *testing.T) {
@@ -423,11 +532,338 @@ func TestKShortestPathWeighted1MinMaxWeight(t *testing.T) {
 			}
 		}`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"_path_":[{"uid":"0x1","_weight_":1.5,"path":{"uid":"0x1f","path":{"uid":"0x3e8","path":{"uid":"0x3ea","path":{"uid":"0x3eb","path|weight":0.600000},"path|weight":0.700000},"path|weight":0.100000},"path|weight":0.100000}}]}}`,
-		js)
+	require.JSONEq(t, `
+		{
+		  "data": {
+		    "_path_": [
+		      {
+		        "path": {
+		          "path": {
+		            "path": {
+		              "path": {
+		                "uid": "0x3eb",
+		                "path|weight": 0.6
+		              },
+		              "uid": "0x3ea",
+		              "path|weight": 0.7
+		            },
+		            "uid": "0x3e8",
+		            "path|weight": 0.1
+		          },
+		          "uid": "0x1f",
+		          "path|weight": 0.1
+		        },
+		        "uid": "0x1",
+		        "_weight_": 1.5
+		      }
+		    ]
+		  }
+		}
+	`, js)
 }
 
+func TestKShortestPathDepth(t *testing.T) {
+	// Shortest path between 1 and 1000 is the path 1 => 31 => 1001 => 1000
+	// but if the depth is less than 3 then there is no direct path between
+	// 1 and 1000. Also if depth >=5 there is another path
+	// 1 => 31 => 1001 => 1003 => 1002 => 1000
+	query := `
+	query test ($depth: int, $numpaths: int) {
+		path as shortest(from: 1, to: 1000, depth: $depth, numpaths: $numpaths) {
+			follow
+		}
+		me(func: uid(path)) {
+			name
+		}
+	}`
+
+	emptyPath := `{"data": {"me":[]}}`
+
+	onePath := `{
+	"data": {
+	  "me": [
+		{"name": "Michonne"},
+		{"name": "Andrea"},
+		{"name": "Bob"},
+		{"name": "Alice"}
+	  ],
+	  "_path_": [
+		{
+		  "follow": {
+			"follow": {
+			  "follow": {
+				"uid": "0x3e8"
+			  },
+			  "uid": "0x3e9"
+			},
+			"uid": "0x1f"
+		  },
+		  "uid": "0x1",
+		  "_weight_": 3
+		}
+	  ]
+	}
+  }`
+	twoPaths := `{
+	"data": {
+	 "me": [
+	{"name": "Michonne"},
+	{"name": "Andrea"},
+	{"name": "Bob"},
+	{"name": "Alice"}
+	 ],
+	 "_path_": [
+	  {
+	   "follow": {
+		"follow": {
+		 "follow": {
+		  "uid": "0x3e8"
+		 },
+		 "uid": "0x3e9"
+		},
+		"uid": "0x1f"
+	   },
+	   "uid": "0x1",
+	   "_weight_": 3
+	  },
+	  {
+	   "follow": {
+		"follow": {
+		 "follow": {
+		  "follow": {
+		   "follow": {
+			"uid": "0x3e8"
+		   },
+		   "uid": "0x3ea"
+		  },
+		  "uid": "0x3eb"
+		 },
+		 "uid": "0x3e9"
+		},
+		"uid": "0x1f"
+	   },
+	   "uid": "0x1",
+	   "_weight_": 5
+	  }
+	 ]
+	}
+   }`
+	tests := []struct {
+		depth, numpaths, output string
+	}{
+		{
+			"2",
+			"4",
+			emptyPath,
+		},
+		{
+			"3",
+			"4",
+			onePath,
+		},
+		{
+			"4",
+			"4",
+			onePath,
+		},
+		{
+			"5",
+			"4",
+			twoPaths,
+		},
+		{
+			"6",
+			"4",
+			twoPaths,
+		},
+	}
+
+	t.Parallel()
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("depth_%s_numpaths_%s", tc.depth, tc.numpaths), func(t *testing.T) {
+			js, err := processQueryWithVars(t, query, map[string]string{"$depth": tc.depth,
+				"$numpaths": tc.numpaths})
+			require.NoError(t, err)
+			require.JSONEq(t, tc.output, js)
+		})
+	}
+}
+
+func TestKShortestPathTwoPaths(t *testing.T) {
+	query := `
+	{
+		A as shortest(from: 51, to:55, numpaths: 2, depth:2) {
+			connects @facets(weight)
+		}
+		me(func: uid(A)) {
+			name
+		}
+	}`
+	js := processQueryNoErr(t, query)
+	require.JSONEq(t, `{
+		"data": {
+		 "me": [
+		  {"name": "A"},
+		  {"name": "C"},
+		  {"name": "D"},
+		  {"name": "E"}
+		 ],
+		 "_path_": [
+		  {
+		   "connects": {
+			"connects": {
+			 "connects": {
+			  "uid": "0x37",
+			  "connects|weight": 1
+			 },
+			 "uid": "0x36",
+			 "connects|weight": 1
+			},
+			"uid": "0x35",
+			"connects|weight": 1
+		   },
+		   "uid": "0x33",
+		   "_weight_": 3
+		  },
+		  {
+		   "connects": {
+			"connects": {
+			 "uid": "0x37",
+			 "connects|weight": 1
+			},
+			"uid": "0x36",
+			"connects|weight": 10
+		   },
+		   "uid": "0x33",
+		   "_weight_": 11
+		  }
+		 ]
+		}
+	   }`, js)
+}
+
+// There are 5 paths between 51 to 55 under "connects" predicate.
+// This tests checks if the algorithm finds only 5 paths and doesn't add
+// cyclical paths when forced to search for 6 or more paths.
+func TestKShortestPathAllPaths(t *testing.T) {
+	for _, q := range []string{
+		`{A as shortest(from: 51, to:55, numpaths: 5) {connects @facets(weight)}
+		me(func: uid(A)) {name}}`,
+		`{A as shortest(from: 51, to:55, numpaths: 6) {connects @facets(weight)}
+		me(func: uid(A)) {name}}`,
+		`{A as shortest(from: 51, to:55, numpaths: 10) {connects @facets(weight)}
+		me(func: uid(A)) {name}}`,
+	} {
+		js := processQueryNoErr(t, q)
+		expected := `
+		{
+			"data":{
+				"me":[
+					{
+						"name":"A"
+					},
+					{
+						"name":"C"
+					},
+					{
+						"name":"D"
+					},
+					{
+						"name":"E"
+					}
+				],
+				"_path_":[
+					{
+						"connects":{
+							"connects":{
+								"connects":{
+									"uid":"0x37",
+									"connects|weight":1
+								},
+								"uid":"0x36",
+								"connects|weight":1
+							},
+							"uid":"0x35",
+							"connects|weight":1
+						},
+						"uid":"0x33",
+						"_weight_":3
+					},
+					{
+						"connects":{
+							"connects":{
+								"uid":"0x37",
+								"connects|weight":1
+							},
+							"uid":"0x36",
+							"connects|weight":10
+						},
+						"uid":"0x33",
+						"_weight_":11
+					},
+					{
+						"connects":{
+							"connects":{
+								"connects":{
+									"connects":{
+										"uid":"0x37",
+										"connects|weight":1
+									},
+									"uid":"0x36",
+									"connects|weight":10
+								},
+								"uid":"0x34",
+								"connects|weight":10
+							},
+							"uid":"0x35",
+							"connects|weight":1
+						},
+						"uid":"0x33",
+						"_weight_":22
+					},
+					{
+						"connects":{
+							"connects":{
+								"connects":{
+									"uid":"0x37",
+									"connects|weight":1
+								},
+								"uid":"0x36",
+								"connects|weight":10
+							},
+							"uid":"0x34",
+							"connects|weight":11
+						},
+						"uid":"0x33",
+						"_weight_":22
+					},
+					{
+						"connects":{
+							"connects":{
+								"connects":{
+									"connects":{
+										"uid":"0x37",
+										"connects|weight":1
+									},
+									"uid":"0x36",
+									"connects|weight":1
+								},
+								"uid":"0x35",
+								"connects|weight":10
+							},
+							"uid":"0x34",
+							"connects|weight":11
+						},
+						"uid":"0x33",
+						"_weight_":23
+					}
+				]
+			}
+		}
+		`
+		testutil.CompareJSON(t, expected, js)
+	}
+}
 func TestTwoShortestPath(t *testing.T) {
 
 	query := `
@@ -613,7 +1049,6 @@ func TestShortestPathWithUidVariableNoMatchForFrom(t *testing.T) {
 	require.JSONEq(t, `{"data":{}}`, js)
 }
 
-// TODO - Later also extend this to k-shortest path.
 func TestShortestPathWithDepth(t *testing.T) {
 	// Shortest path between A and B is the path A => C => D => B but if the depth is less than 3
 	// then the direct path between A and B should be returned.
@@ -632,73 +1067,153 @@ func TestShortestPathWithDepth(t *testing.T) {
 		}
 	}`
 
-	directPath := `{
+	directPath := `
+	{
 		"data": {
-		  "path": [
-			{
-			  "uid": "0x33",
-			  "name": "A"
-			},
-			{
-			  "uid": "0x34",
-			  "name": "B"
-			}
-		  ],
-		  "_path_": [
-			{
-			  "connects": {
-				"uid": "0x34",
-				"connects|weight": 10
-			  },
-			  "uid": "0x33",
-			  "_weight_": 10
-			}
-		  ]
-		}
-	  }`
-
-	shortestPath := `{
-		"data": {
-		  "path": [
-			{
-			  "uid": "0x33",
-			  "name": "A"
-			},
-			{
-			  "uid": "0x35",
-			  "name": "C"
-			},
-			{
-			  "uid": "0x36",
-			  "name": "D"
-			},
-			{
-			  "uid": "0x34",
-			  "name": "B"
-			}
-		  ],
-		  "_path_": [
-			{
-			  "connects": {
-				"connects": {
-				  "connects": {
-					"uid": "0x34",
-					"connects|weight": 1
-				  },
-				  "uid": "0x36",
-				  "connects|weight": 1
+			"path": [
+				{
+					"uid": "0x33",
+					"name": "A"
 				},
-				"uid": "0x35",
-				"connects|weight": 1
-			  },
-			  "uid": "0x33",
-			  "_weight_": 3
-			}
-		  ]
+				{
+					"uid": "0x34",
+					"name": "B"
+				}
+			],
+			"_path_": [
+				{
+					"connects": {
+						"uid": "0x34",
+						"connects|weight": 11
+					},
+					"uid": "0x33",
+					"_weight_": 11
+				}
+			]
+		}
+	}`
+
+	shortestPath := `
+	{
+		"data": {
+			"path": [
+				{
+					"uid": "0x33",
+					"name": "A"
+				},
+				{
+					"uid": "0x35",
+					"name": "C"
+				},
+				{
+					"uid": "0x36",
+					"name": "D"
+				},
+				{
+					"uid": "0x34",
+					"name": "B"
+				}
+			],
+			"_path_": [
+				{
+					"connects": {
+						"connects": {
+							"connects": {
+								"uid": "0x34",
+								"connects|weight": 2
+							},
+							"connects|weight": 1,
+							"uid": "0x36"
+						},
+						"uid": "0x35",
+						"connects|weight": 1
+					},
+					"uid": "0x33",
+					"_weight_": 4
+				}
+			]
 		}
 	}`
 
 	emptyPath := `{"data":{"path":[]}}`
+
+	allPaths := `{
+		"data": {
+		 "path": [
+		  {"uid": "0x33","name": "A"},
+		  {"uid": "0x35","name": "C"},
+		  {"uid": "0x36","name": "D"},
+		  {"uid": "0x34","name": "B"}
+		 ],
+		 "_path_": [
+		  {
+		   "connects": {
+			"connects": {
+			 "connects": {
+			  "uid": "0x34",
+			  "connects|weight": 2
+			 },
+			 "uid": "0x36",
+			 "connects|weight": 1
+			},
+			"uid": "0x35",
+			"connects|weight": 1
+		   },
+		   "uid": "0x33",
+		   "_weight_": 4
+		  },
+		  {
+		   "connects": {
+			"connects": {
+			 "uid": "0x34",
+			 "connects|weight": 10
+			},
+			"uid": "0x35",
+			"connects|weight": 1
+		   },
+		   "uid": "0x33",
+		   "_weight_": 11
+		  },
+		  {
+		   "connects": {
+			"uid": "0x34",
+			"connects|weight": 11
+		   },
+		   "uid": "0x33",
+		   "_weight_": 11
+		  },
+		  {
+		   "connects": {
+			"connects": {
+			 "uid": "0x34",
+			 "connects|weight": 2
+			},
+			"uid": "0x36",
+			"connects|weight": 10
+		   },
+		   "uid": "0x33",
+		   "_weight_": 12
+		  },
+		  {
+		   "connects": {
+			"connects": {
+			 "connects": {
+			  "uid": "0x34",
+			  "connects|weight": 10
+			 },
+			 "uid": "0x35",
+			 "connects|weight": 10
+			},
+			"uid": "0x36",
+			"connects|weight": 10
+		   },
+		   "uid": "0x33",
+		   "_weight_": 30
+		  }
+		 ]
+		}
+	}
+	`
 
 	tests := []struct {
 		depth, numpaths, output string
@@ -728,33 +1243,27 @@ func TestShortestPathWithDepth(t *testing.T) {
 			"1",
 			shortestPath,
 		},
+		//The test cases below are for k-shortest path queries with varying depths.
 		{
 			"0",
 			"10",
 			emptyPath,
 		},
-		// The test cases below are for k-shortest path queries with varying depths. They don't pass
-		// right now and hence are commented out...
-		// {
-		// 	"1",
-		// 	"10",
-		// 	directPath,
-		// },
-		// {
-		// 	"2",
-		// 	"10",
-		// 	directPath,
-		// },
-		// {
-		// 	"3",
-		// 	"10",
-		// 	shortestPath,
-		// },
-		// {
-		// 	"10",
-		// 	"10",
-		// 	shortestPath,
-		// },
+		{
+			"1",
+			"10",
+			directPath,
+		},
+		{
+			"2",
+			"10",
+			allPaths,
+		},
+		{
+			"10",
+			"10",
+			allPaths,
+		},
 	}
 
 	t.Parallel()
@@ -789,28 +1298,28 @@ func TestShortestPathWithDepth_direct_path_is_shortest(t *testing.T) {
 
 	directPath := `{
 		"data": {
-		  "path": [
-			{
-			  "uid": "0x36",
-			  "name": "D"
-			},
-			{
-			  "uid": "0x34",
-			  "name": "B"
-			}
-		  ],
-		  "_path_": [
-			{
-			  "connects": {
-				"uid": "0x34",
-				"connects|weight": 1
-			  },
-			  "uid": "0x36",
-			  "_weight_": 1
-			}
-		  ]
+			"path": [
+				{
+					"uid": "0x36",
+					"name": "D"
+				},
+				{
+					"uid": "0x34",
+					"name": "B"
+				}
+			],
+			"_path_": [
+				{
+					"connects": {
+						"uid": "0x34",
+						"connects|weight": 2
+					},
+					"uid": "0x36",
+					"_weight_": 2
+				}
+			]
 		}
-	  }`
+	}`
 
 	tests := []struct {
 		name, depth, output string
@@ -872,44 +1381,44 @@ func TestShortestPathWithDepth_no_direct_path(t *testing.T) {
 
 	shortestPath := `{
 		"data": {
-		  "path": [
-			{
-			  "uid": "0x33",
-			  "name": "A"
-			},
-			{
-			  "uid": "0x35",
-			  "name": "C"
-			},
-			{
-			  "uid": "0x36",
-			  "name": "D"
-			},
-			{
-			  "uid": "0x37",
-			  "name": "E"
-			}
-		  ],
-		  "_path_": [
-			{
-			  "connects": {
-				"connects": {
-				  "connects": {
-					"uid": "0x37",
-					"connects|weight": 1
-				  },
-				  "uid": "0x36",
-				  "connects|weight": 1
+			"path": [
+				{
+					"uid": "0x33",
+					"name": "A"
 				},
-				"uid": "0x35",
-				"connects|weight": 1
-			  },
-			  "uid": "0x33",
-			  "_weight_": 3
-			}
-		  ]
+				{
+					"uid": "0x35",
+					"name": "C"
+				},
+				{
+					"uid": "0x36",
+					"name": "D"
+				},
+				{
+					"uid": "0x37",
+					"name": "E"
+				}
+			],
+			"_path_": [
+				{
+					"connects": {
+						"connects": {
+							"connects": {
+								"uid": "0x37",
+								"connects|weight": 1
+							},
+							"uid": "0x36",
+							"connects|weight": 1
+						},
+						"uid": "0x35",
+						"connects|weight": 1
+					},
+					"uid": "0x33",
+					"_weight_": 3
+				}
+			]
 		}
-	  }`
+	}`
 
 	emptyPath := `{"data":{"path":[]}}`
 
@@ -972,46 +1481,48 @@ func TestShortestPathWithDepth_test_for_hoppy_behavior(t *testing.T) {
 		}
 	}`
 
-	shortestPath := `{
-		"data": {
-		  "path": [
-			{
-			  "uid": "0x38",
-			  "name": "F"
-			},
-			{
-			  "uid": "0x3a",
-			  "name": "H"
-			},
-			{
-			  "uid": "0x3b",
-			  "name": "I"
-			},
-			{
-			  "uid": "0x3c",
-			  "name": "J"
-			}
-		  ],
-		  "_path_": [
-			{
-			  "connects": {
-				"connects": {
-				  "connects": {
-					"uid": "0x3c",
-					"connects|weight": 1
-				  },
-				  "uid": "0x3b",
-				  "connects|weight": 1
-				},
-				"uid": "0x3a",
-				"connects|weight": 1
-			  },
-			  "uid": "0x38",
-			  "_weight_": 3
-			}
-		  ]
+	shortestPath := `
+		{
+		    "data": {
+		        "path": [
+		            {
+		                "uid": "0x38",
+		                "name": "F"
+		            },
+		            {
+		                "uid": "0x3a",
+		                "name": "H"
+		            },
+		            {
+		                "uid": "0x3b",
+		                "name": "I"
+		            },
+		            {
+		                "uid": "0x3c",
+		                "name": "J"
+		            }
+		        ],
+		        "_path_": [
+		            {
+		                "connects": {
+		                    "connects": {
+		                        "connects": {
+		                            "uid": "0x3c",
+		                            "connects|weight": 1
+		                        },
+		                        "uid": "0x3b",
+		                        "connects|weight": 1
+		                    },
+		                    "uid": "0x3a",
+		                    "connects|weight": 1
+		                },
+		                "uid": "0x38",
+		                "_weight_": 3
+		            }
+		        ]
+		    }
 		}
-	  }`
+	`
 
 	tests := []struct {
 		name, depth, output string
@@ -1121,9 +1632,51 @@ func TestShortestPathWeights(t *testing.T) {
 			}
 		}`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data":{"me":[{"name":"Michonne"},{"name":"Andrea"},{"name":"Alice"},{"name":"Bob"},{"name":"Matt"}],"_path_":[{"uid":"0x1","_weight_":0.4,"path":{"uid":"0x1f","path":{"uid":"0x3e8","path":{"uid":"0x3e9","path":{"uid":"0x3ea","path|weight":0.100000},"path|weight":0.100000},"path|weight":0.100000},"path|weight":0.100000}}]}}`,
-		js)
+	require.JSONEq(t, `
+		{
+		    "data": {
+		        "me": [
+		            {
+		                "name": "Michonne"
+		            },
+		            {
+		                "name": "Andrea"
+		            },
+		            {
+		                "name": "Alice"
+		            },
+		            {
+		                "name": "Bob"
+		            },
+		            {
+		                "name": "Matt"
+		            }
+		        ],
+		        "_path_": [
+		            {
+		                "path": {
+		                    "path": {
+		                        "path": {
+		                            "path": {
+		                                "uid": "0x3ea",
+		                                "path|weight": 0.1
+		                            },
+		                            "uid": "0x3e9",
+		                            "path|weight": 0.1
+		                        },
+		                        "uid": "0x3e8",
+		                        "path|weight": 0.1
+		                    },
+		                    "uid": "0x1f",
+		                    "path|weight": 0.1
+		                },
+		                "uid": "0x1",
+		                "_weight_": 0.4
+		            }
+		        ]
+		    }
+		}
+	`, js)
 }
 
 func TestShortestPath2(t *testing.T) {
@@ -1141,8 +1694,7 @@ func TestShortestPath2(t *testing.T) {
 	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
 		`{"data": {"_path_":[{"uid":"0x1","_weight_":2,"path":{"uid":"0x1f","path":{"uid":"0x3e8"}}}],"me":[{"name":"Michonne"},{"name":"Andrea"},{"name":"Alice"}]}}
-`,
-		js)
+	`, js)
 }
 
 func TestShortestPath4(t *testing.T) {
@@ -1153,14 +1705,45 @@ func TestShortestPath4(t *testing.T) {
 				follow
 			}
 
-			me(func: uid( A)) {
+			me(func: uid(A)) {
 				name
 			}
 		}`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t,
-		`{"data": {"_path_":[{"uid":"0x1","_weight_":3,"follow":{"uid":"0x1f","follow":{"uid":"0x3e9","follow":{"uid":"0x3eb"}}}}],"me":[{"name":"Michonne"},{"name":"Andrea"},{"name":"Bob"},{"name":"John"}]}}`,
-		js)
+	require.JSONEq(t, `
+	{
+		"data": {
+			"_path_":[
+				{
+					"uid":"0x1",
+					"_weight_":3,
+					"follow":{
+						"uid":"0x1f",
+						"follow":{
+							"uid":"0x3e9",
+							"follow":{
+								"uid":"0x3eb"
+							}
+						}
+					}
+				}
+			],
+			"me":[
+				{
+					"name":"Michonne"
+				},
+				{
+					"name":"Andrea"
+				},
+				{
+					"name":"Bob"
+				},
+				{
+					"name":"John"
+				}
+			]
+		}
+	}`, js)
 }
 
 func TestShortestPath_filter(t *testing.T) {
@@ -1758,7 +2341,7 @@ func TestPasswordExpandAll1(t *testing.T) {
     }
 	`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t, `{"data":{"me":[{"name":"Michonne"}]}}`, js)
+	require.JSONEq(t, `{"data":{"me":[{"alive":true, "gender":"female","name":"Michonne"}]}}`, js)
 }
 
 func TestPasswordExpandAll2(t *testing.T) {
@@ -1771,7 +2354,8 @@ func TestPasswordExpandAll2(t *testing.T) {
     }
 	`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t, `{"data":{"me":[{"name":"Michonne", "checkpwd(password)":false}]}}`, js)
+	require.JSONEq(t, `{"data":{"me":[{"alive":true, "checkpwd(password)":false,
+	"gender":"female", "name":"Michonne"}]}}`, js)
 }
 
 func TestPasswordExpandError(t *testing.T) {
@@ -2486,7 +3070,8 @@ func TestTypeFunction(t *testing.T) {
 	`
 	js := processQueryNoErr(t, query)
 	require.JSONEq(t,
-		`{"data": {"me":[{"uid":"0x2"}, {"uid":"0x3"}, {"uid":"0x4"}, {"uid":"0xcb"}]}}`,
+		`{"data": {"me":[{"uid":"0x2"}, {"uid":"0x3"}, {"uid":"0x4"},{"uid":"0x17"},
+		{"uid":"0x18"},{"uid":"0x19"}, {"uid":"0x1f"}, {"uid":"0xcb"}]}}`,
 		js)
 }
 
@@ -2560,17 +3145,17 @@ func TestQueryUnknownType(t *testing.T) {
 func TestQuerySingleType(t *testing.T) {
 	query := `schema(type: Person) {}`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t, `{"data": {"types":[{"name":"Person",
-		"fields":[{"name":"name"}, {"name":"pet"}]}]}}`,
+	require.JSONEq(t, `{"data":{"types":[{"fields":[{"name":"name"},{"name":"pet"},
+	{"name":"friend"},{"name":"gender"},{"name":"alive"}],"name":"Person"}]}}`,
 		js)
 }
 
 func TestQueryMultipleTypes(t *testing.T) {
 	query := `schema(type: [Person, Animal]) {}`
 	js := processQueryNoErr(t, query)
-	require.JSONEq(t, `{"data": {"types":[{"name":"Animal",
-		"fields":[{"name":"name"}]},
-	{"name":"Person", "fields":[{"name":"name"}, {"name":"pet"}]}]}}`, js)
+	require.JSONEq(t, `{"data":{"types":[{"fields":[{"name":"name"}],"name":"Animal"},
+	{"fields":[{"name":"name"},{"name":"pet"},{"name":"friend"},{"name":"gender"},
+	{"name":"alive"}],"name":"Person"}]}}`, js)
 }
 
 func TestRegexInFilterNoDataOnRoot(t *testing.T) {
@@ -2610,7 +3195,8 @@ func TestMultiRegexInFilter(t *testing.T) {
 		}
 	`
 	res := processQueryNoErr(t, query)
-	require.JSONEq(t, `{"data": {"q": [{"name": "Michonne"}]}}`, res)
+	require.JSONEq(t, `{"data": {"q": [{"alive":true, "gender":"female",
+	"name":"Michonne"}]}}`, res)
 }
 
 func TestMultiRegexInFilter2(t *testing.T) {
@@ -2629,4 +3215,18 @@ func TestMultiRegexInFilter2(t *testing.T) {
 		res := processQueryNoErr(t, query)
 		require.JSONEq(t, `{"data": {"q": [{"firstName": "Han", "lastName":"Solo"}]}}`, res)
 	}
+}
+
+func TestRegexFuncWithAfter(t *testing.T) {
+	query := `
+		{
+			q(func: regexp(name, /^Ali/i), after: 0x2710) {
+				uid
+				name
+			}
+		}
+	`
+
+	res := processQueryNoErr(t, query)
+	require.JSONEq(t, `{"data": {"q": [{"name": "Alice", "uid": "0x2712"}, {"name": "Alice", "uid": "0x2714"}]}}`, res)
 }

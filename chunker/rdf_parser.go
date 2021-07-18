@@ -22,7 +22,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v210/protos/api"
 	"github.com/dgraph-io/dgraph/lex"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
@@ -36,9 +36,9 @@ var (
 	ErrEmpty = errors.New("RDF: harmless error, e.g. comment line")
 )
 
-// Function to do sanity check for subject, predicate, object and label strings.
+// Function to do sanity check for subject, predicate and object strings.
 func sane(s string) bool {
-	// Label and ObjectId can be "", we already check that subject and predicate
+	// ObjectId can be "", we already check that subject and predicate
 	// shouldn't be empty.
 	if len(s) == 0 {
 		return true
@@ -72,6 +72,10 @@ func ParseRDFs(b []byte) ([]*api.NQuad, *pb.Metadata, error) {
 	return nqs, calculateTypeHints(nqs), nil
 }
 
+func isSpaceRune(r rune) bool {
+	return r == ' '
+}
+
 // ParseRDF parses a mutation string and returns the N-Quad representation for it.
 // It parses N-Quad statements based on http://www.w3.org/TR/n-quads/.
 func ParseRDF(line string, l *lex.Lexer) (api.NQuad, error) {
@@ -97,7 +101,7 @@ L:
 		item := it.Item()
 		switch item.Typ {
 		case itemSubject:
-			rnq.Subject = strings.Trim(item.Val, " ")
+			rnq.Subject = strings.TrimFunc(item.Val, isSpaceRune)
 
 		case itemSubjectFunc:
 			var err error
@@ -113,10 +117,10 @@ L:
 
 		case itemPredicate:
 			// Here we split predicate and lang directive (ex: "name@en"), if needed.
-			rnq.Predicate, rnq.Lang = x.PredicateLang(strings.Trim(item.Val, " "))
+			rnq.Predicate, rnq.Lang = x.PredicateLang(strings.TrimFunc(item.Val, isSpaceRune))
 
 		case itemObject:
-			rnq.ObjectId = strings.Trim(item.Val, " ")
+			rnq.ObjectId = strings.TrimFunc(item.Val, isSpaceRune)
 
 		case itemStar:
 			switch {
@@ -144,9 +148,9 @@ L:
 				return rnq, errors.Errorf("If predicate/subject is *, value should be * as well")
 			}
 
-			val := strings.Trim(item.Val, " ")
+			val := strings.TrimFunc(item.Val, isSpaceRune)
 			// TODO: Check if this condition is required.
-			if strings.Trim(val, " ") == "*" {
+			if val == "*" {
 				return rnq, errors.Errorf("itemObject can't be *")
 			}
 			// Lets find out the storage type from the type map.
@@ -190,7 +194,12 @@ L:
 			break L
 
 		case itemLabel:
-			rnq.Label = strings.Trim(item.Val, " ")
+			s := strings.TrimFunc(item.Val, isSpaceRune)
+			namespace, err := strconv.ParseUint(s, 0, 64)
+			if err != nil {
+				return rnq, errors.Errorf("Invalid namespace ID. Input: [%s]", line)
+			}
+			rnq.Namespace = namespace
 
 		case itemLeftRound:
 			it.Prev() // backup '('
@@ -217,8 +226,7 @@ L:
 	if len(rnq.ObjectId) == 0 && rnq.ObjectValue == nil {
 		return rnq, errors.Errorf("No Object in NQuad. Input: [%s]", line)
 	}
-	if !sane(rnq.Subject) || !sane(rnq.Predicate) ||
-		!sane(rnq.ObjectId) || !sane(rnq.Label) {
+	if !sane(rnq.Subject) || !sane(rnq.Predicate) || !sane(rnq.ObjectId) {
 		return rnq, errors.Errorf("NQuad failed sanity check:%+v", rnq)
 	}
 
@@ -350,6 +358,7 @@ var typeMap = map[string]types.TypeID{
 	"xs:date":            types.DateTimeID,
 	"xs:dateTime":        types.DateTimeID,
 	"xs:int":             types.IntID,
+	"xs:integer":         types.IntID,
 	"xs:positiveInteger": types.IntID,
 	"xs:boolean":         types.BoolID,
 	"xs:double":          types.FloatID,

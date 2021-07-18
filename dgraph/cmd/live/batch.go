@@ -31,10 +31,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/dgo/v2"
-	"github.com/dgraph-io/dgo/v2/protos/api"
-	"github.com/dgraph-io/dgraph/dgraph/cmd/zero"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/dgo/v210"
+	"github.com/dgraph-io/dgo/v210/protos/api"
 	"github.com/dgraph-io/dgraph/gql"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/tok"
@@ -42,6 +42,7 @@ import (
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/dgraph-io/dgraph/xidmap"
 	"github.com/dgryski/go-farm"
+	"github.com/dustin/go-humanize"
 	"github.com/dustin/go-humanize/english"
 )
 
@@ -73,22 +74,23 @@ type loader struct {
 	retryRequestsWg sync.WaitGroup
 
 	// Miscellaneous information to print counters.
-	// Num of N-Quads sent
-	nquads uint64
-	// Num of txns sent
-	txns uint64
-	// Num of aborts
-	aborts uint64
-	// To get time elapsed
-	start time.Time
+	nquads   uint64    // Num of N-Quads sent
+	txns     uint64    // Num of txns sent
+	aborts   uint64    // Num of aborts
+	start    time.Time // To get time elapsed
+	inflight int32     // Number of inflight requests.
+	conc     int32     // Number of request makers.
 
 	conflicts map[uint64]struct{}
 	uidsLock  sync.RWMutex
 
-	reqNum   uint64
-	reqs     chan request
-	zeroconn *grpc.ClientConn
-	schema   *schema
+	reqNum     uint64
+	reqs       chan *request
+	zeroconn   *grpc.ClientConn
+	schema     *schema
+	namespaces map[uint64]struct{}
+
+	upsertLock sync.RWMutex
 }
 
 // Counter keeps a track of various parameters about a batch mutation. Running totals are printed
@@ -114,7 +116,12 @@ func handleError(err error, isRetry bool) {
 	s := status.Convert(err)
 	switch {
 	case s.Code() == codes.Internal, s.Code() == codes.Unavailable:
-		x.Fatalf(s.Message())
+		// Let us not crash live loader due to this. Instead, we should infinitely retry to
+		// reconnect and retry the request.
+		dur := time.Duration(1+rand.Intn(60)) * time.Second
+		fmt.Printf("Connection has been possibly interrupted. Got error: %v."+
+			" Will retry after %s.\n", err, dur.Round(time.Second))
+		time.Sleep(dur)
 	case strings.Contains(s.Message(), "x509"):
 		x.Fatalf(s.Message())
 	case s.Code() == codes.Aborted:
@@ -125,19 +132,17 @@ func handleError(err error, isRetry bool) {
 		dur := time.Duration(1+rand.Intn(10)) * time.Minute
 		fmt.Printf("Server is overloaded. Will retry after %s.\n", dur.Round(time.Minute))
 		time.Sleep(dur)
-	case err != zero.ErrConflict && err != dgo.ErrAborted:
+	case err != x.ErrConflict && err != dgo.ErrAborted:
 		fmt.Printf("Error while mutating: %v s.Code %v\n", s.Message(), s.Code())
 	}
 }
 
-func (l *loader) infinitelyRetry(req request) {
+func (l *loader) infinitelyRetry(req *request) {
 	defer l.retryRequestsWg.Done()
-	defer l.deregister(&req)
+	defer l.deregister(req)
 	nretries := 1
 	for i := time.Millisecond; ; i *= 2 {
-		txn := l.dc.NewTxn()
-		req.CommitNow = true
-		_, err := txn.Mutate(l.opts.Ctx, req.Mutation)
+		err := l.mutate(req)
 		if err == nil {
 			if opt.verbose {
 				fmt.Printf("Transaction succeeded after %s.\n",
@@ -157,16 +162,26 @@ func (l *loader) infinitelyRetry(req request) {
 	}
 }
 
-func (l *loader) request(req request) {
-	atomic.AddUint64(&l.reqNum, 1)
+func (l *loader) mutate(req *request) error {
+	atomic.AddInt32(&l.inflight, 1)
 	txn := l.dc.NewTxn()
 	req.CommitNow = true
-	_, err := txn.Mutate(l.opts.Ctx, req.Mutation)
+	request := &api.Request{
+		CommitNow: true,
+		Mutations: []*api.Mutation{req.Mutation},
+	}
+	_, err := txn.Do(l.opts.Ctx, request)
+	atomic.AddInt32(&l.inflight, -1)
+	return err
+}
 
+func (l *loader) request(req *request) {
+	atomic.AddUint64(&l.reqNum, 1)
+	err := l.mutate(req)
 	if err == nil {
 		atomic.AddUint64(&l.nquads, uint64(len(req.Set)))
 		atomic.AddUint64(&l.txns, 1)
-		l.deregister(&req)
+		l.deregister(req)
 		return
 	}
 	handleError(err, false)
@@ -191,6 +206,7 @@ func getTypeVal(val *api.Value) (types.Val, error) {
 	}
 
 	p1.Value = p1.Value.([]byte)
+	p1.Tid = p.Tid
 	return p1, nil
 }
 
@@ -198,7 +214,7 @@ func createUidEdge(nq *api.NQuad, sid, oid uint64) *pb.DirectedEdge {
 	return &pb.DirectedEdge{
 		Entity:    sid,
 		Attr:      nq.Predicate,
-		Label:     nq.Label,
+		Namespace: nq.Namespace,
 		Lang:      nq.Lang,
 		Facets:    nq.Facets,
 		ValueId:   oid,
@@ -208,11 +224,11 @@ func createUidEdge(nq *api.NQuad, sid, oid uint64) *pb.DirectedEdge {
 
 func createValueEdge(nq *api.NQuad, sid uint64) (*pb.DirectedEdge, error) {
 	p := &pb.DirectedEdge{
-		Entity: sid,
-		Attr:   nq.Predicate,
-		Label:  nq.Label,
-		Lang:   nq.Lang,
-		Facets: nq.Facets,
+		Entity:    sid,
+		Attr:      nq.Predicate,
+		Namespace: nq.Namespace,
+		Lang:      nq.Lang,
+		Facets:    nq.Facets,
 	}
 	val, err := getTypeVal(nq.ObjectValue)
 	if err != nil {
@@ -237,6 +253,16 @@ func fingerprintEdge(t *pb.DirectedEdge, pred *predicate) uint64 {
 }
 
 func (l *loader) conflictKeysForNQuad(nq *api.NQuad) ([]uint64, error) {
+	attr := x.NamespaceAttr(nq.Namespace, nq.Predicate)
+	pred, found := l.schema.preds[attr]
+
+	// We dont' need to generate conflict keys for predicate with noconflict directive.
+	if found && pred.NoConflict {
+		return nil, nil
+	}
+
+	keys := make([]uint64, 0)
+
 	// Calculates the conflict keys, inspired by the logic in
 	// addMutationInteration in posting/list.go.
 	sid, err := strconv.ParseUint(nq.Subject, 0, 64)
@@ -256,17 +282,16 @@ func (l *loader) conflictKeysForNQuad(nq *api.NQuad) ([]uint64, error) {
 		x.Check(err)
 	}
 
-	keys := make([]uint64, 0, 1)
-	pred, ok := l.schema.preds[nq.Predicate]
-	if !ok {
+	// If the predicate is not found in schema then we don't have to generate any more keys.
+	if !found {
 		return keys, nil
 	}
 
 	if pred.List {
 		key := fingerprintEdge(de, pred)
-		keys = append(keys, farm.Fingerprint64(x.DataKey(nq.Predicate, sid))^key)
+		keys = append(keys, farm.Fingerprint64(x.DataKey(attr, sid))^key)
 	} else {
-		keys = append(keys, farm.Fingerprint64(x.DataKey(nq.Predicate, sid)))
+		keys = append(keys, farm.Fingerprint64(x.DataKey(attr, sid)))
 	}
 
 	if pred.Reverse {
@@ -274,7 +299,7 @@ func (l *loader) conflictKeysForNQuad(nq *api.NQuad) ([]uint64, error) {
 		if err != nil {
 			return keys, err
 		}
-		keys = append(keys, farm.Fingerprint64(x.DataKey(nq.Predicate, oi)))
+		keys = append(keys, farm.Fingerprint64(x.DataKey(attr, oi)))
 	}
 
 	if nq.ObjectValue == nil || !(pred.Count || pred.Index) {
@@ -298,13 +323,13 @@ func (l *loader) conflictKeysForNQuad(nq *api.NQuad) ([]uint64, error) {
 		if err != nil {
 			errs = append(errs, err.Error())
 		}
-		toks, err := tok.BuildTokens(schemaVal.Value, tok.GetLangTokenizer(token, nq.Lang))
+		toks, err := tok.BuildTokens(schemaVal.Value, tok.GetTokenizerForLang(token, nq.Lang))
 		if err != nil {
 			errs = append(errs, err.Error())
 		}
 
 		for _, t := range toks {
-			keys = append(keys, farm.Fingerprint64(x.IndexKey(nq.Predicate, t))^sid)
+			keys = append(keys, farm.Fingerprint64(x.IndexKey(attr, t))^sid)
 		}
 
 	}
@@ -358,39 +383,69 @@ func (l *loader) deregister(req *request) {
 // makeRequests can receive requests from batchNquads or directly from BatchSetWithMark.
 // It doesn't need to batch the requests anymore. Batching is already done for it by the
 // caller functions.
-func (l *loader) makeRequests() {
+func (l *loader) makeRequests(id int) {
 	defer l.requestsWg.Done()
+	atomic.AddInt32(&l.conc, 1)
+	defer atomic.AddInt32(&l.conc, -1)
 
-	buffer := make([]request, 0, l.opts.bufferSize)
-	drain := func(maxSize int) {
-		for len(buffer) > maxSize {
-			i := 0
-			for _, req := range buffer {
-				// If there is no conflict in req, we will use it
-				// and then it would shift all the other reqs in buffer
-				if !l.addConflictKeys(&req) {
-					buffer[i] = req
-					i++
-					continue
-				}
-				// Req will no longer be part of a buffer
-				l.request(req)
+	buffer := make([]*request, 0, l.opts.bufferSize)
+	var loops int
+	drain := func() {
+		i := 0
+		for _, req := range buffer {
+			loops++
+			// If there is no conflict in req, we will use it
+			// and then it would shift all the other reqs in buffer
+			if !l.addConflictKeys(req) {
+				buffer[i] = req
+				i++
+				continue
 			}
-			buffer = buffer[:i]
-		}
-	}
-
-	for req := range l.reqs {
-		req.conflicts = l.conflictKeysForReq(&req)
-		if l.addConflictKeys(&req) {
+			// Req will no longer be part of a buffer
 			l.request(req)
-		} else {
-			buffer = append(buffer, req)
 		}
-		drain(l.opts.bufferSize - 1)
+		buffer = buffer[:i]
 	}
 
-	drain(0)
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+
+outer:
+	for {
+		select {
+		case req, ok := <-l.reqs:
+			if !ok {
+				break outer
+			}
+			req.conflicts = l.conflictKeysForReq(req)
+			if l.addConflictKeys(req) {
+				l.request(req)
+			} else {
+				buffer = append(buffer, req)
+			}
+
+		case <-t.C:
+			for {
+				drain()
+				if len(buffer) < l.opts.bufferSize {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}
+
+	for len(buffer) > 0 {
+		select {
+		case <-t.C:
+			fmt.Printf("[%2d] Draining. len(buffer): %d\n", id, len(buffer))
+		default:
+		}
+
+		drain()
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Printf("[%2d] Looped %d times over buffered requests.\n", id, loops)
 }
 
 func (l *loader) printCounters() {
@@ -398,15 +453,17 @@ func (l *loader) printCounters() {
 	l.ticker = time.NewTicker(period)
 	start := time.Now()
 
-	var last Counter
+	r := y.NewRateMonitor(6) // Last 30 seconds of samples.
 	for range l.ticker.C {
-		counter := l.Counter()
-		rate := float64(counter.Nquads-last.Nquads) / period.Seconds()
+		c := l.Counter()
+		r.Capture(c.Nquads)
 		elapsed := time.Since(start).Round(time.Second)
 		timestamp := time.Now().Format("15:04:05Z0700")
-		fmt.Printf("[%s] Elapsed: %s Txns: %d N-Quads: %d N-Quads/s [last 5s]: %5.0f Aborts: %d\n",
-			timestamp, x.FixedDuration(elapsed), counter.TxnsDone, counter.Nquads, rate, counter.Aborts)
-		last = counter
+		fmt.Printf("[%s] Elapsed: %s Txns: %d N-Quads: %s N-Quads/s: %s"+
+			" Inflight: %2d/%2d Aborts: %d\n",
+			timestamp, x.FixedDuration(elapsed), c.TxnsDone,
+			humanize.Comma(int64(c.Nquads)), humanize.Comma(int64(r.Rate())),
+			atomic.LoadInt32(&l.inflight), atomic.LoadInt32(&l.conc), c.Aborts)
 	}
 }
 

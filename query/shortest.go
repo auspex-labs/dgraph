@@ -23,10 +23,12 @@ import (
 	"sync"
 
 	"github.com/dgraph-io/dgraph/algo"
+	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/types/facets"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/dgraph-io/sroar"
 	"github.com/pkg/errors"
 )
 
@@ -62,6 +64,15 @@ var errStop = errors.Errorf("STOP")
 var errFacet = errors.Errorf("Skip the edge")
 
 type priorityQueue []*queueItem
+
+func (r *route) indexOf(uid uint64) int {
+	for i, val := range *r.route {
+		if val.uid == uid {
+			return i
+		}
+	}
+	return -1
+}
 
 func (h priorityQueue) Len() int { return len(h) }
 
@@ -146,12 +157,12 @@ func (sg *SubGraph) expandOut(ctx context.Context,
 	var exec []*SubGraph
 	var err error
 	in := []uint64{sg.Params.From}
-	sg.SrcUIDs = &pb.List{Uids: in}
-	sg.uidMatrix = []*pb.List{{Uids: in}}
-	sg.DestUIDs = sg.SrcUIDs
+	sg.SrcUIDs = &pb.List{SortedUids: in}
+	sg.uidMatrix = []*pb.List{{SortedUids: in}}
+	sg.DestMap = codec.FromList(sg.SrcUIDs)
 
 	for _, child := range sg.Children {
-		child.SrcUIDs = sg.DestUIDs
+		child.SrcUIDs = sg.SrcUIDs
 		exec = append(exec, child)
 	}
 	dummy := &SubGraph{}
@@ -194,14 +205,14 @@ func (sg *SubGraph) expandOut(ctx context.Context,
 				// it explicitly here to ensure the results are correct.
 				subgraph.updateUidMatrix()
 				// Send the destuids in res chan.
-				for mIdx, fromUID := range subgraph.SrcUIDs.Uids {
+				for mIdx, fromUID := range codec.GetUids(subgraph.SrcUIDs) {
 					// This can happen when trying to go traverse a predicate of type password
 					// for example.
 					if mIdx >= len(subgraph.uidMatrix) {
 						continue
 					}
 
-					for lIdx, toUID := range subgraph.uidMatrix[mIdx].Uids {
+					for lIdx, toUID := range codec.GetUids(subgraph.uidMatrix[mIdx]) {
 						if adjacencyMap[fromUID] == nil {
 							adjacencyMap[fromUID] = make(map[uint64]mapItem)
 						}
@@ -229,17 +240,17 @@ func (sg *SubGraph) expandOut(ctx context.Context,
 			}
 		}
 
-		if numEdges > x.Config.QueryEdgeLimit {
+		if numEdges > x.Config.LimitQueryEdge {
 			// If we've seen too many edges, stop the query.
 			rch <- errors.Errorf("Exceeded query edge limit = %v. Found %v edges.",
-				x.Config.QueryEdgeLimit, numEdges)
+				x.Config.LimitMutationsNquad, numEdges)
 			return
 		}
 
 		// modify the exec and attach child nodes.
 		var out []*SubGraph
 		for _, subgraph := range exec {
-			if len(subgraph.DestUIDs.Uids) == 0 {
+			if subgraph.DestMap.IsEmpty() {
 				continue
 			}
 			select {
@@ -251,7 +262,7 @@ func (sg *SubGraph) expandOut(ctx context.Context,
 					temp := new(SubGraph)
 					temp.copyFiltersRecurse(child)
 
-					temp.SrcUIDs = subgraph.DestUIDs
+					temp.SrcUIDs = codec.ToSortedList(subgraph.DestMap)
 					// Remove those nodes which we have already traversed. As this cannot be
 					// in the path again.
 					algo.ApplyFilter(temp.SrcUIDs, func(uid uint64, i int) bool {
@@ -303,7 +314,7 @@ func runKShortestPaths(ctx context.Context, sg *SubGraph) ([]*SubGraph, error) {
 	}
 	heap.Push(&pq, srcNode)
 
-	numHops := -1
+	numHops := 0
 	maxHops := math.MaxInt32
 	if sg.Params.ExploreDepth != nil {
 		maxHops = int(*sg.Params.ExploreDepth)
@@ -331,8 +342,13 @@ func runKShortestPaths(ctx context.Context, sg *SubGraph) ([]*SubGraph, error) {
 				continue
 			}
 
-			// Add path to list.
+			// Add path to list after making a copy of the path in itemRoute. A copy of
+			// *item.path.route is required because it has to be put back in the sync pool and a
+			// future reuse can alter the item already present in kroute because it is a pointer.
+			itemRoute := make([]pathInfo, len(*item.path.route))
+			copy(itemRoute, *item.path.route)
 			newRoute := item.path
+			newRoute.route = &itemRoute
 			newRoute.totalWeight = item.cost
 			kroutes = append(kroutes, newRoute)
 			if len(kroutes) == numPaths {
@@ -340,7 +356,7 @@ func runKShortestPaths(ctx context.Context, sg *SubGraph) ([]*SubGraph, error) {
 				break
 			}
 		}
-		if item.hop > numHops && numHops < maxHops {
+		if item.hop > numHops-1 && numHops < maxHops {
 			// Explore the next level by calling processGraph and add them
 			// to the queue.
 			if !stopExpansion {
@@ -364,9 +380,6 @@ func runKShortestPaths(ctx context.Context, sg *SubGraph) ([]*SubGraph, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
-			if stopExpansion {
-				continue
-			}
 		}
 		neighbours := adjacencyMap[item.uid]
 		for toUid, info := range neighbours {
@@ -375,7 +388,10 @@ func runKShortestPaths(ctx context.Context, sg *SubGraph) ([]*SubGraph, error) {
 			if item.cost+cost > maxWeight {
 				continue
 			}
-
+			// Skip neighbour if it present in current path to remove cyclical paths
+			if len(*item.path.route) > 0 && item.path.indexOf(toUid) != -1 {
+				continue
+			}
 			curPath := pathPool.Get().(*[]pathInfo)
 			if curPath == nil {
 				return nil, errors.Errorf("Sync pool returned a nil pointer")
@@ -410,19 +426,22 @@ func runKShortestPaths(ctx context.Context, sg *SubGraph) ([]*SubGraph, error) {
 	next <- false
 
 	if len(kroutes) == 0 {
-		sg.DestUIDs = &pb.List{}
+		sg.DestMap = sroar.NewBitmap()
 		return nil, nil
 	}
-	var res []uint64
+
+	var result []uint64
+	// TODO: The order would be wrong here for the path. Fix that later.
 	for _, it := range *kroutes[0].route {
-		res = append(res, it.uid)
+		result = append(result, it.uid)
+		sg.DestMap.Set(it.uid)
 	}
-	sg.DestUIDs.Uids = res
 	shortestSg := createkroutesubgraph(ctx, kroutes)
+	sg.OrderedUIDs = &pb.List{SortedUids: result}
 	return shortestSg, nil
 }
 
-// Djikstras algorithm pseudocode for reference.
+// Dijkstra's algorithm pseudocode for reference.
 //
 //
 // 1  function Dijkstra(Graph, source):
@@ -592,7 +611,7 @@ func shortestPath(ctx context.Context, sg *SubGraph) ([]*SubGraph, error) {
 		cur = dist[cur].parent
 	}
 	if cur != sg.Params.From {
-		sg.DestUIDs = &pb.List{}
+		sg.DestMap = sroar.NewBitmap()
 		return nil, nil
 	}
 
@@ -602,7 +621,9 @@ func shortestPath(ctx context.Context, sg *SubGraph) ([]*SubGraph, error) {
 		result[i], result[l-i-1] = result[l-i-1], result[i]
 	}
 	// Put the path in DestUIDs of the root.
-	sg.DestUIDs.Uids = result
+	// TODO: This would result in out of order SortedUids.
+	sg.DestMap.SetMany(result)
+	sg.OrderedUIDs = &pb.List{SortedUids: result}
 
 	shortestSg := createPathSubgraph(ctx, dist, totalWeight, result)
 	return []*SubGraph{shortestSg}, nil
@@ -619,9 +640,9 @@ func createPathSubgraph(ctx context.Context, dist map[uint64]nodeInfo, totalWeig
 		weight: totalWeight,
 	}
 	curUid := result[0]
-	shortestSg.SrcUIDs = &pb.List{Uids: []uint64{curUid}}
-	shortestSg.DestUIDs = &pb.List{Uids: []uint64{curUid}}
-	shortestSg.uidMatrix = []*pb.List{{Uids: []uint64{curUid}}}
+	shortestSg.SrcUIDs = &pb.List{SortedUids: []uint64{curUid}}
+	shortestSg.DestMap = codec.FromList(shortestSg.SrcUIDs)
+	shortestSg.uidMatrix = []*pb.List{{SortedUids: []uint64{curUid}}}
 
 	curNode := shortestSg
 	for i := 0; i < len(result)-1; i++ {
@@ -638,9 +659,10 @@ func createPathSubgraph(ctx context.Context, dist map[uint64]nodeInfo, totalWeig
 		}
 		node.Attr = nodeInfo.attr
 		node.facetsMatrix = []*pb.FacetsList{{FacetsList: []*pb.Facets{nodeInfo.facet}}}
-		node.SrcUIDs = &pb.List{Uids: []uint64{curUid}}
-		node.DestUIDs = &pb.List{Uids: []uint64{childUid}}
-		node.uidMatrix = []*pb.List{{Uids: []uint64{childUid}}}
+		node.SrcUIDs = &pb.List{SortedUids: []uint64{curUid}}
+		node.DestMap = sroar.NewBitmap()
+		node.DestMap.Set(childUid)
+		node.uidMatrix = []*pb.List{{SortedUids: []uint64{childUid}}}
 
 		curNode.Children = append(curNode.Children, node)
 		curNode = node
@@ -651,8 +673,8 @@ func createPathSubgraph(ctx context.Context, dist map[uint64]nodeInfo, totalWeig
 		Shortest: true,
 	}
 	uid := result[len(result)-1]
-	node.SrcUIDs = &pb.List{Uids: []uint64{uid}}
-	node.uidMatrix = []*pb.List{{Uids: []uint64{uid}}}
+	node.SrcUIDs = &pb.List{SortedUids: []uint64{uid}}
+	node.uidMatrix = []*pb.List{{SortedUids: []uint64{uid}}}
 	curNode.Children = append(curNode.Children, node)
 
 	return shortestSg
@@ -670,9 +692,9 @@ func createkroutesubgraph(ctx context.Context, kroutes []route) []*SubGraph {
 			weight: it.totalWeight,
 		}
 		curUid := (*it.route)[0].uid
-		shortestSg.SrcUIDs = &pb.List{Uids: []uint64{curUid}}
-		shortestSg.DestUIDs = &pb.List{Uids: []uint64{curUid}}
-		shortestSg.uidMatrix = []*pb.List{{Uids: []uint64{curUid}}}
+		shortestSg.SrcUIDs = &pb.List{SortedUids: []uint64{curUid}}
+		shortestSg.DestMap = codec.FromList(shortestSg.SrcUIDs)
+		shortestSg.uidMatrix = []*pb.List{{SortedUids: []uint64{curUid}}}
 
 		curNode := shortestSg
 		i := 0
@@ -689,9 +711,9 @@ func createkroutesubgraph(ctx context.Context, kroutes []route) []*SubGraph {
 			}
 			node.Attr = (*it.route)[i+1].attr
 			node.facetsMatrix = []*pb.FacetsList{{FacetsList: []*pb.Facets{(*it.route)[i+1].facet}}}
-			node.SrcUIDs = &pb.List{Uids: []uint64{curUid}}
-			node.DestUIDs = &pb.List{Uids: []uint64{childUid}}
-			node.uidMatrix = []*pb.List{{Uids: []uint64{childUid}}}
+			node.SrcUIDs = &pb.List{SortedUids: []uint64{curUid}}
+			node.DestMap = codec.FromList(node.SrcUIDs)
+			node.uidMatrix = []*pb.List{{SortedUids: []uint64{childUid}}}
 
 			curNode.Children = append(curNode.Children, node)
 			curNode = node
@@ -702,8 +724,8 @@ func createkroutesubgraph(ctx context.Context, kroutes []route) []*SubGraph {
 			Shortest: true,
 		}
 		uid := (*it.route)[i].uid
-		node.SrcUIDs = &pb.List{Uids: []uint64{uid}}
-		node.uidMatrix = []*pb.List{{Uids: []uint64{uid}}}
+		node.SrcUIDs = &pb.List{SortedUids: []uint64{uid}}
+		node.uidMatrix = []*pb.List{{SortedUids: []uint64{uid}}}
 		curNode.Children = append(curNode.Children, node)
 
 		res = append(res, shortestSg)

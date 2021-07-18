@@ -15,9 +15,10 @@ package acl
 import (
 	"encoding/json"
 
-	"github.com/dgraph-io/dgo/v2"
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v210"
+	"github.com/dgraph-io/dgo/v210/protos/api"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
@@ -72,6 +73,7 @@ type User struct {
 	Uid           string  `json:"uid"`
 	UserID        string  `json:"dgraph.xid"`
 	Password      string  `json:"dgraph.password"`
+	Namespace     uint64  `json:"namespace"`
 	PasswordMatch bool    `json:"password_match"`
 	Groups        []Group `json:"dgraph.user.group"`
 }
@@ -106,8 +108,8 @@ func UnmarshalUser(resp *api.Response, userKey string) (user *User, err error) {
 // Acl represents the permissions in the ACL system.
 // An Acl can have a predicate and permission for that predicate.
 type Acl struct {
-	Predicate string `json:"predicate"`
-	Perm      int32  `json:"perm"`
+	Predicate string `json:"dgraph.rule.predicate"`
+	Perm      int32  `json:"dgraph.rule.permission"`
 }
 
 // Group represents a group in the ACL system.
@@ -115,7 +117,7 @@ type Group struct {
 	Uid     string `json:"uid"`
 	GroupID string `json:"dgraph.xid"`
 	Users   []User `json:"~dgraph.user.group"`
-	Acls    string `json:"dgraph.group.acl"`
+	Rules   []Acl  `json:"dgraph.acl.rule"`
 }
 
 // GetUid returns the UID of the group.
@@ -162,10 +164,11 @@ func UnmarshalGroups(input []byte, groupKey string) (group []Group, err error) {
 // options, and then login using groot id and password
 func getClientWithAdminCtx(conf *viper.Viper) (*dgo.Dgraph, x.CloseFunc, error) {
 	dg, closeClient := x.GetDgraphClient(conf, false)
+	creds := z.NewSuperFlag(conf.GetString("guardian-creds"))
 	err := x.GetPassAndLogin(dg, &x.CredOpt{
-		Conf:        conf,
-		UserID:      conf.GetString(gName),
-		PasswordOpt: gPassword,
+		UserID:    creds.GetString("user"),
+		Password:  creds.GetString("password"),
+		Namespace: creds.GetUint64("namespace"),
 	})
 	if err != nil {
 		return nil, nil, err
@@ -190,7 +193,7 @@ func CreateUserNQuads(userId, password string) []*api.NQuad {
 		{
 			Subject:     "_:newuser",
 			Predicate:   "dgraph.type",
-			ObjectValue: &api.Value{Val: &api.Value_StrVal{StrVal: "User"}},
+			ObjectValue: &api.Value{Val: &api.Value_StrVal{StrVal: "dgraph.type.User"}},
 		},
 	}
 }
@@ -206,7 +209,7 @@ func CreateGroupNQuads(groupId string) []*api.NQuad {
 		{
 			Subject:     "_:newgroup",
 			Predicate:   "dgraph.type",
-			ObjectValue: &api.Value{Val: &api.Value_StrVal{StrVal: "Group"}},
+			ObjectValue: &api.Value{Val: &api.Value_StrVal{StrVal: "dgraph.type.Group"}},
 		},
 	}
 }

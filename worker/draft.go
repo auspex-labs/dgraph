@@ -18,55 +18,323 @@ package worker
 
 import (
 	"bytes"
+	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
+	"github.com/golang/glog"
+	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
+	"golang.org/x/net/trace"
 
 	ostats "go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	otrace "go.opencensus.io/trace"
 
-	"github.com/dgraph-io/badger/v2"
-	bpb "github.com/dgraph-io/badger/v2/pb"
-	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/badger/v3"
+	bpb "github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/skl"
+	"github.com/dgraph-io/badger/v3/table"
+	"github.com/dgraph-io/badger/v3/y"
 	"github.com/dgraph-io/dgraph/conn"
-	"github.com/dgraph-io/dgraph/dgraph/cmd/zero"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/raftwal"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
-	"github.com/pkg/errors"
-
-	"github.com/golang/glog"
-	"golang.org/x/net/context"
-	"golang.org/x/net/trace"
+	"github.com/dgraph-io/ristretto/z"
 )
 
+const (
+	sensitiveString = "******"
+)
+
+type operation struct {
+	*z.Closer
+	ts uint64
+}
+
 type node struct {
+	// This needs to be 64 bit aligned for atomics to work on 32 bit machine.
+	pendingSize int64
+
+	// embedded struct
 	*conn.Node
 
 	// Fields which are never changed after init.
-	applyCh  chan []*pb.Proposal
-	rollupCh chan uint64 // Channel to run posting list rollups.
-	ctx      context.Context
-	gid      uint32
-	closer   *y.Closer
+	applyCh      chan []raftpb.Entry
+	concApplyCh  chan *pb.Proposal
+	drainApplyCh chan struct{}
+	ctx          context.Context
+	gid          uint32
+	closer       *z.Closer
 
-	streaming int32 // Used to avoid calculating snapshot
+	checkpointTs uint64 // Timestamp corresponding to checkpoint.
+	streaming    int32  // Used to avoid calculating snapshot
 
+	// Used to track the ops going on in the system.
+	ops         map[op]operation
+	opsLock     sync.Mutex
+	cdcTracker  *CDC
 	canCampaign bool
 	elog        trace.EventLog
 
-	pendingSize int64
+	keysWritten      *keysWritten
+	pendingProposals []pb.Proposal
+}
+
+// keysWritten is always accessed serially via applyCh. So, we don't need to make it thread-safe.
+type keysWritten struct {
+	rejectBeforeIndex uint64
+	keyCommitTs       map[uint64]uint64
+	validTxns         int64
+	invalidTxns       int64
+	totalKeys         int
+}
+
+func newKeysWritten() *keysWritten {
+	return &keysWritten{
+		keyCommitTs: make(map[uint64]uint64),
+	}
+}
+
+// We use keysWritten structure to allow mutations to be run concurrently. Consider this:
+// 1. We receive a txn with mutation at start ts = Ts.
+// 2. The server is at MaxAssignedTs Tm < Ts.
+// 3. Before, we would block proposing until Tm >= Ts.
+// 4. Now, we propose the mutation immediately.
+// 5. Once the mutation goes through raft, it is executed concurrently, and the "seen" MaxAssignedTs
+//    is registered as Tm-seen.
+// 6. The same mutation is also pushed to applyCh.
+// 7. When applyCh sees the mutation, it checks if any reads the txn incurred, have been written to
+//    with a commit ts in the range (Tm-seen, Ts]. If so, the mutation is re-run. In 21M live load,
+//    this happens about 3.6% of the time.
+// 8. If no commits have happened for the read key set, we are done. This happens 96.4% of the time.
+// 9. If multiple mutations happen for the same txn, the sequential mutations are always run
+//    serially by applyCh. This is to avoid edge cases.
+func (kw *keysWritten) StillValid(txn *posting.Txn) bool {
+	if txn.AppliedIndexSeen < kw.rejectBeforeIndex {
+		kw.invalidTxns++
+		return false
+	}
+	if txn.MaxAssignedSeen >= txn.StartTs {
+		kw.validTxns++
+		return true
+	}
+	for hash := range txn.ReadKeys() {
+		// If the commitTs is between (MaxAssignedSeen, StartTs], the txn reads were invalid. If the
+		// commitTs is > StartTs, then it doesn't matter for reads. If the commit ts is <
+		// MaxAssignedSeen, that means our reads are valid.
+		commitTs := kw.keyCommitTs[hash]
+		if commitTs > txn.MaxAssignedSeen && commitTs <= txn.StartTs {
+			kw.invalidTxns++
+			return false
+		}
+	}
+	kw.validTxns++
+	return true
+}
+
+type op int
+
+func (id op) String() string {
+	switch id {
+	case opRollup:
+		return "opRollup"
+	case opSnapshot:
+		return "opSnapshot"
+	case opIndexing:
+		return "opIndexing"
+	case opRestore:
+		return "opRestore"
+	case opBackup:
+		return "opBackup"
+	case opPredMove:
+		return "opPredMove"
+	default:
+		return "opUnknown"
+	}
+}
+
+const (
+	opRollup op = iota + 1
+	opSnapshot
+	opIndexing
+	opRestore
+	opBackup
+	opPredMove
+)
+
+// startTask is used for the tasks that do not require tracking of timestamp.
+// Currently, only the timestamps for backup and indexing needs to be tracked because they can
+// run concurrently.
+func (n *node) startTask(id op) (*z.Closer, error) {
+	return n.startTaskAtTs(id, 0)
+}
+
+// startTaskAtTs is used to check whether an op is already running. If a rollup is running,
+// it is canceled and startTask will wait until it completes before returning.
+// If the same task is already running, this method returns an errror.
+// Restore operations have preference and cancel all other operations, not just rollups.
+// You should only call Done() on the returned closer. Calling other functions (such as
+// SignalAndWait) for closer could result in panics. For more details, see GitHub issue #5034.
+func (n *node) startTaskAtTs(id op, ts uint64) (*z.Closer, error) {
+	n.opsLock.Lock()
+	defer n.opsLock.Unlock()
+
+	stopTask := func(id op) {
+		n.opsLock.Lock()
+		delete(n.ops, id)
+		n.opsLock.Unlock()
+		glog.Infof("Operation completed with id: %s", id)
+
+		// Resume rollups if another operation is being stopped.
+		if id != opRollup {
+			time.Sleep(10 * time.Second) // Wait for 10s to start rollup operation.
+			// If any other operation is running, this would error out. This error can
+			// be safely ignored because rollups will resume once that other task is done.
+			_, _ = n.startTask(opRollup)
+		}
+	}
+
+	closer := z.NewCloser(1)
+	switch id {
+	case opRollup:
+		if len(n.ops) > 0 {
+			return nil, errors.Errorf("another operation is already running")
+		}
+		go posting.IncrRollup.Process(closer)
+	case opRestore:
+		// Restores cancel all other operations, except for other restores since
+		// only one restore operation should be active any given moment.
+		for otherId, otherOp := range n.ops {
+			if otherId == opRestore {
+				return nil, errors.Errorf("another restore operation is already running")
+			}
+			// Remove from map and signal the closer to cancel the operation.
+			delete(n.ops, otherId)
+			otherOp.SignalAndWait()
+		}
+	case opBackup:
+		// Backup cancels all other operations, except for other backups since
+		// only one backup operation should be active any given moment. Also, indexing at higher
+		// timestamp can also run concurrently with backup.
+		for otherId, otherOp := range n.ops {
+			if otherId == opBackup {
+				return nil, errors.Errorf("another backup operation is already running")
+			}
+			// Remove from map and signal the closer to cancel the operation.
+			delete(n.ops, otherId)
+			otherOp.SignalAndWait()
+		}
+	case opIndexing:
+		for otherId, otherOp := range n.ops {
+			switch otherId {
+			case opBackup:
+				if otherOp.ts < ts {
+					// If backup is running at higher timestamp, then indexing can't be executed.
+					continue
+				} else {
+					return nil, errors.Errorf("operation %s is already running", otherId)
+				}
+			case opRollup:
+				// Remove from map and signal the closer to cancel the operation.
+				delete(n.ops, otherId)
+				otherOp.SignalAndWait()
+			default:
+				return nil, errors.Errorf("operation %s is already running", otherId)
+			}
+		}
+	case opSnapshot, opPredMove:
+		for otherId, otherOp := range n.ops {
+			if otherId == opRollup {
+				// Remove from map and signal the closer to cancel the operation.
+				delete(n.ops, otherId)
+				otherOp.SignalAndWait()
+			} else {
+				return nil, errors.Errorf("operation %s is already running", otherId)
+			}
+		}
+	default:
+		glog.Errorf("Got an unhandled operation %s. Ignoring...", id)
+		return nil, nil
+	}
+
+	n.ops[id] = operation{Closer: closer, ts: ts}
+	glog.Infof("Operation started with id: %s", id)
+	go func(id op, closer *z.Closer) {
+		closer.Wait()
+		stopTask(id)
+	}(id, closer)
+	return closer, nil
+}
+
+func (n *node) stopTask(id op) {
+	n.opsLock.Lock()
+	closer, ok := n.ops[id]
+	n.opsLock.Unlock()
+	if !ok {
+		return
+	}
+	closer.SignalAndWait()
+}
+
+func (n *node) waitForTask(id op) {
+	n.opsLock.Lock()
+	closer, ok := n.ops[id]
+	n.opsLock.Unlock()
+	if !ok {
+		return
+	}
+	closer.Wait()
+}
+
+func (n *node) isRunningTask(id op) bool {
+	n.opsLock.Lock()
+	_, ok := n.ops[id]
+	n.opsLock.Unlock()
+	return ok
+}
+
+func (n *node) stopAllTasks() {
+	defer n.closer.Done() // CLOSER:1
+	<-n.closer.HasBeenClosed()
+
+	glog.Infof("Stopping all ongoing registered tasks...")
+	n.opsLock.Lock()
+	defer n.opsLock.Unlock()
+	for op, closer := range n.ops {
+		glog.Infof("Stopping op: %s...\n", op)
+		closer.SignalAndWait()
+	}
+	glog.Infof("Stopped all ongoing registered tasks.")
+}
+
+// GetOngoingTasks returns the list of ongoing tasks.
+func GetOngoingTasks() []string {
+	n := groups().Node
+	if n == nil {
+		return []string{}
+	}
+
+	n.opsLock.Lock()
+	defer n.opsLock.Unlock()
+	var tasks []string
+	for id := range n.ops {
+		tasks = append(tasks, id.String())
+	}
+	return tasks
 }
 
 // Now that we apply txn updates via Raft, waiting based on Txn timestamps is
@@ -75,12 +343,15 @@ type node struct {
 func newNode(store *raftwal.DiskStorage, gid uint32, id uint64, myAddr string) *node {
 	glog.Infof("Node ID: %#x with GroupID: %d\n", id, gid)
 
+	isLearner := x.WorkerConfig.Raft.GetBool("learner")
 	rc := &pb.RaftContext{
-		Addr:  myAddr,
-		Group: gid,
-		Id:    id,
+		Addr:      myAddr,
+		Group:     gid,
+		Id:        id,
+		IsLearner: isLearner,
 	}
-	m := conn.NewNode(rc, store)
+	glog.Infof("RaftContext: %+v\n", rc)
+	m := conn.NewNode(rc, store, x.WorkerConfig.TLSClientConfig)
 
 	n := &node{
 		Node: m,
@@ -89,15 +360,19 @@ func newNode(store *raftwal.DiskStorage, gid uint32, id uint64, myAddr string) *
 		// We need a generous size for applyCh, because raft.Tick happens every
 		// 10ms. If we restrict the size here, then Raft goes into a loop trying
 		// to maintain quorum health.
-		applyCh:  make(chan []*pb.Proposal, 1000),
-		rollupCh: make(chan uint64, 3),
-		elog:     trace.NewEventLog("Dgraph", "ApplyCh"),
-		closer:   y.NewCloser(3), // Matches CLOSER:1
+		applyCh:      make(chan []raftpb.Entry, 1000),
+		concApplyCh:  make(chan *pb.Proposal, 100),
+		drainApplyCh: make(chan struct{}),
+		elog:         trace.NewEventLog("Dgraph", "ApplyCh"),
+		closer:       z.NewCloser(4), // Matches CLOSER:1
+		ops:          make(map[op]operation),
+		cdcTracker:   newCDC(),
+		keysWritten:  newKeysWritten(),
 	}
 	return n
 }
 
-func (n *node) Ctx(key string) context.Context {
+func (n *node) Ctx(key uint64) context.Context {
 	if pctx := n.Proposals.Get(key); pctx != nil {
 		return pctx.Ctx
 	}
@@ -132,6 +407,7 @@ func detectPendingTxns(attr string) error {
 	tctxs := posting.Oracle().IterateTxns(func(key []byte) bool {
 		pk, err := x.Parse(key)
 		if err != nil {
+			glog.Errorf("error %v while parsing key %v", err, hex.EncodeToString(key))
 			return false
 		}
 		return pk.Attr == attr
@@ -143,6 +419,123 @@ func detectPendingTxns(attr string) error {
 	return errHasPendingTxns
 }
 
+func (n *node) mutationWorker(workerId int) {
+	handleEntry := func(p *pb.Proposal) {
+		x.AssertTrue(p.Key != 0)
+		x.AssertTrue(len(p.Mutations.GetEdges()) > 0)
+
+		ctx := n.Ctx(p.Key)
+		x.AssertTrue(ctx != nil)
+		span := otrace.FromContext(ctx)
+		span.Annotatef(nil, "Executing mutation from worker id: %d", workerId)
+
+		txn := posting.Oracle().GetTxn(p.Mutations.StartTs)
+		x.AssertTruef(txn != nil, "Unable to find txn with start ts: %d", p.Mutations.StartTs)
+		txn.ErrCh <- n.concMutations(ctx, p.Mutations, txn)
+		close(txn.ErrCh)
+	}
+
+	for {
+		select {
+		case mut, ok := <-n.concApplyCh:
+			if !ok {
+				return
+			}
+			handleEntry(mut)
+		case <-n.closer.HasBeenClosed():
+			return
+		}
+	}
+}
+
+func (n *node) concMutations(ctx context.Context, m *pb.Mutations, txn *posting.Txn) error {
+	// It is possible that the user gives us multiple versions of the same edge, one with no facets
+	// and another with facets. In that case, use stable sort to maintain the ordering given to us
+	// by the user.
+	// TODO: Do this in a way, where we don't break multiple updates for the same Edge across
+	// different goroutines.
+	sort.SliceStable(m.Edges, func(i, j int) bool {
+		ei := m.Edges[i]
+		ej := m.Edges[j]
+		if ei.GetAttr() != ej.GetAttr() {
+			return ei.GetAttr() < ej.GetAttr()
+		}
+		return ei.GetEntity() < ej.GetEntity()
+	})
+
+	span := otrace.FromContext(ctx)
+	if txn.ShouldAbort() {
+		span.Annotatef(nil, "Txn %d should abort.", m.StartTs)
+		return x.ErrConflict
+	}
+	// Discard the posting lists from cache to release memory at the end.
+	defer func() {
+		txn.Update(ctx)
+		span.Annotate(nil, "update done")
+	}()
+
+	// Update the applied index that we are seeing.
+	if txn.AppliedIndexSeen == 0 {
+		txn.AppliedIndexSeen = n.Applied.DoneUntil()
+	}
+	if txn.MaxAssignedSeen == 0 {
+		txn.MaxAssignedSeen = posting.Oracle().MaxAssigned()
+	}
+
+	// This txn's Zero assigned start ts could be in the future, because we're
+	// trying to greedily run mutations concurrently as soon as we see them.
+	// In this case, MaxAssignedSeen could be < txn.StartTs. We'd
+	// opportunistically do the processing of this mutation anyway. And later,
+	// check if everything that we read is still valid, or was it changed. If
+	// it was indeed changed, we can re-do the work.
+
+	process := func(edges []*pb.DirectedEdge) error {
+		var retries int
+		for _, edge := range edges {
+			for {
+				err := runMutation(ctx, edge, txn)
+				if err == nil {
+					break
+				}
+				if err != posting.ErrRetry {
+					return err
+				}
+				retries++
+			}
+		}
+		if retries > 0 {
+			span.Annotatef(nil, "retries=true num=%d", retries)
+		}
+		return nil
+	}
+	numGo, width := x.DivideAndRule(len(m.Edges))
+	span.Annotatef(nil, "To apply: %d edges. NumGo: %d. Width: %d", len(m.Edges), numGo, width)
+
+	if numGo == 1 {
+		span.Annotate(nil, "Process mutations done.")
+		return process(m.Edges)
+	}
+	errCh := make(chan error, numGo)
+	for i := 0; i < numGo; i++ {
+		start := i * width
+		end := start + width
+		if end > len(m.Edges) {
+			end = len(m.Edges)
+		}
+		go func(start, end int) {
+			errCh <- process(m.Edges[start:end])
+		}(start, end)
+	}
+	var rerr error
+	for i := 0; i < numGo; i++ {
+		if err := <-errCh; err != nil && rerr == nil {
+			rerr = err
+		}
+	}
+	span.Annotate(nil, "Process mutations done.")
+	return rerr
+}
+
 // We don't support schema mutations across nodes in a transaction.
 // Wait for all transactions to either abort or complete and all write transactions
 // involving the predicate are aborted until schema mutations are done.
@@ -150,13 +543,36 @@ func (n *node) applyMutations(ctx context.Context, proposal *pb.Proposal) (rerr 
 	span := otrace.FromContext(ctx)
 
 	if proposal.Mutations.DropOp == pb.Mutations_DATA {
+		ns, err := strconv.ParseUint(proposal.Mutations.DropValue, 0, 64)
+		if err != nil {
+			return err
+		}
 		// Ensures nothing get written to disk due to commit proposals.
-		posting.Oracle().ResetTxns()
-		return posting.DeleteData()
+		n.keysWritten.rejectBeforeIndex = proposal.Index
+
+		// Stop rollups, otherwise we might end up overwriting some new data.
+		n.stopTask(opRollup)
+		defer n.startTask(opRollup)
+
+		posting.Oracle().ResetTxnsForNs(ns)
+		if err := posting.DeleteData(ns); err != nil {
+			return err
+		}
+
+		// TODO: Revisit this when we work on posting cache. Clear entire cache.
+		// We don't want to drop entire cache, just due to one namespace.
+		// posting.ResetCache()
+		return nil
 	}
 
 	if proposal.Mutations.DropOp == pb.Mutations_ALL {
 		// Ensures nothing get written to disk due to commit proposals.
+		n.keysWritten.rejectBeforeIndex = proposal.Index
+
+		// Stop rollups, otherwise we might end up overwriting some new data.
+		n.stopTask(opRollup)
+		defer n.startTask(opRollup)
+
 		posting.Oracle().ResetTxns()
 		schema.State().DeleteAll()
 
@@ -164,19 +580,24 @@ func (n *node) applyMutations(ctx context.Context, proposal *pb.Proposal) (rerr 
 			return err
 		}
 
-		if groups().groupId() == 1 {
-			initialSchema := schema.InitialSchema()
-			for _, s := range initialSchema {
-				if err := updateSchema(s); err != nil {
-					return err
-				}
+		// Clear entire cache.
+		posting.ResetCache()
 
-				if servesTablet, err := groups().ServesTablet(s.Predicate); err != nil {
+		// It should be okay to set the schema at timestamp 1 after drop all operation.
+		if groups().groupId() == 1 {
+			initialSchema := schema.InitialSchema(x.GalaxyNamespace)
+			for _, s := range initialSchema {
+				if err := applySchema(s, 1); err != nil {
 					return err
-				} else if !servesTablet {
-					return errors.Errorf("group 1 should always serve reserved predicate %s",
-						s.Predicate)
 				}
+			}
+		}
+
+		// Propose initial types as well after a drop all as they would have been cleared.
+		initialTypes := schema.InitialTypes(x.GalaxyNamespace)
+		for _, t := range initialTypes {
+			if err := updateType(t.GetTypeName(), *t, 1); err != nil {
+				return err
 			}
 		}
 
@@ -184,28 +605,42 @@ func (n *node) applyMutations(ctx context.Context, proposal *pb.Proposal) (rerr 
 	}
 
 	if proposal.Mutations.DropOp == pb.Mutations_TYPE {
-		return schema.State().DeleteType(proposal.Mutations.DropValue)
+		n.keysWritten.rejectBeforeIndex = proposal.Index
+		return schema.State().DeleteType(proposal.Mutations.DropValue, proposal.StartTs)
 	}
 
 	if proposal.Mutations.StartTs == 0 {
 		return errors.New("StartTs must be provided")
 	}
-	startTs := proposal.Mutations.StartTs
 
 	if len(proposal.Mutations.Schema) > 0 || len(proposal.Mutations.Types) > 0 {
+		n.keysWritten.rejectBeforeIndex = proposal.Index
+
+		// MaxAssigned would ensure that everything that's committed up until this point
+		// would be picked up in building indexes. Any uncommitted txns would be cancelled
+		// by detectPendingTxns below.
+		startTs := posting.Oracle().MaxAssigned()
+
 		span.Annotatef(nil, "Applying schema and types")
 		for _, supdate := range proposal.Mutations.Schema {
 			// We should not need to check for predicate move here.
 			if err := detectPendingTxns(supdate.Predicate); err != nil {
 				return err
 			}
-			if err := runSchemaMutation(ctx, supdate, startTs); err != nil {
-				return err
-			}
+		}
+
+		if err := runSchemaMutation(ctx, proposal.Mutations.Schema, startTs); err != nil {
+			return err
+		}
+
+		// Clear the entire cache if there is a schema update because the index rebuild
+		// will invalidate the state.
+		if len(proposal.Mutations.Schema) > 0 {
+			posting.ResetCache()
 		}
 
 		for _, tupdate := range proposal.Mutations.Types {
-			if err := runTypeMutation(ctx, tupdate); err != nil {
+			if err := runTypeMutation(ctx, tupdate, startTs); err != nil {
 				return err
 			}
 		}
@@ -230,7 +665,8 @@ func (n *node) applyMutations(ctx context.Context, proposal *pb.Proposal) (rerr 
 				return err
 			}
 			span.Annotatef(nil, "Deleting predicate: %s", edge.Attr)
-			return posting.DeletePredicate(ctx, edge.Attr)
+			n.keysWritten.rejectBeforeIndex = proposal.Index
+			return posting.DeletePredicate(ctx, edge.Attr, proposal.StartTs)
 		}
 		// Don't derive schema when doing deletion.
 		if edge.Op == pb.DirectedEdge_DEL {
@@ -257,96 +693,59 @@ func (n *node) applyMutations(ctx context.Context, proposal *pb.Proposal) (rerr 
 	for attr, storageType := range schemaMap {
 		if _, err := schema.State().TypeOf(attr); err != nil {
 			hint := pb.Metadata_DEFAULT
-			if mutHint, ok := proposal.Mutations.Metadata.PredHints[attr]; ok {
+			if mutHint, ok := proposal.GetMutations().GetMetadata().GetPredHints()[attr]; ok {
 				hint = mutHint
 			}
-			if err := createSchema(attr, storageType, hint); err != nil {
+			if err := createSchema(attr, storageType, hint, proposal.StartTs); err != nil {
 				return err
 			}
 		}
 	}
 
 	m := proposal.Mutations
-	txn := posting.Oracle().RegisterStartTs(m.StartTs)
-	if txn.ShouldAbort() {
-		span.Annotatef(nil, "Txn %d should abort.", m.StartTs)
-		return zero.ErrConflict
+	txn := posting.Oracle().GetTxn(m.StartTs)
+	x.AssertTruef(txn != nil, "Unable to find txn with start ts: %d", m.StartTs)
+	runs := atomic.AddInt32(&txn.Runs, 1)
+	if runs <= 1 {
+		// If we didn't have it in Oracle, then mutation workers won't be processing it either. So,
+		// don't block on txn.ErrCh.
+		err, ok := <-txn.ErrCh
+		x.AssertTrue(ok)
+		if err == nil && n.keysWritten.StillValid(txn) {
+			span.Annotate(nil, "Mutation is still valid.")
+			return nil
+		}
+		// If mutation is invalid or we got an error, reset the txn, so we can run again.
+		txn = posting.Oracle().ResetTxn(m.StartTs)
+		atomic.AddInt32(&txn.Runs, 1) // We have already run this once via serial loop.
 	}
 
-	// Discard the posting lists from cache to release memory at the end.
-	defer txn.Update()
-
-	// It is possible that the user gives us multiple versions of the same edge, one with no facets
-	// and another with facets. In that case, use stable sort to maintain the ordering given to us
-	// by the user.
-	// TODO: Do this in a way, where we don't break multiple updates for the same Edge across
-	// different goroutines.
-	sort.SliceStable(m.Edges, func(i, j int) bool {
-		ei := m.Edges[i]
-		ej := m.Edges[j]
-		if ei.GetAttr() != ej.GetAttr() {
-			return ei.GetAttr() < ej.GetAttr()
-		}
-		return ei.GetEntity() < ej.GetEntity()
-	})
-
-	process := func(edges []*pb.DirectedEdge) error {
-		var retries int
-		for _, edge := range edges {
-			for {
-				err := runMutation(ctx, edge, txn)
-				if err == nil {
-					break
-				}
-				if err != posting.ErrRetry {
-					return err
-				}
-				retries++
-			}
-		}
-		if retries > 0 {
-			span.Annotatef(nil, "retries=true num=%d", retries)
-		}
-		return nil
-	}
-	numGo, width := x.DivideAndRule(len(m.Edges))
-	span.Annotatef(nil, "To apply: %d edges. NumGo: %d. Width: %d", len(m.Edges), numGo, width)
-
-	if numGo == 1 {
-		return process(m.Edges)
-	}
-	errCh := make(chan error, numGo)
-	for i := 0; i < numGo; i++ {
-		start := i * width
-		end := start + width
-		if end > len(m.Edges) {
-			end = len(m.Edges)
-		}
-		go func(start, end int) {
-			errCh <- process(m.Edges[start:end])
-		}(start, end)
-	}
-	for i := 0; i < numGo; i++ {
-		if err := <-errCh; err != nil {
-			return err
-		}
-	}
-	return nil
+	// If we have an error, re-run this.
+	span.Annotatef(nil, "Re-running mutation from applyCh. Runs: %d", runs)
+	return n.concMutations(ctx, m, txn)
 }
 
 func (n *node) applyCommitted(proposal *pb.Proposal) error {
-	ctx := n.Ctx(proposal.Key)
+	key := proposal.Key
+	ctx := n.Ctx(key)
 	span := otrace.FromContext(ctx)
-	span.Annotatef(nil, "node.applyCommitted Node id: %d. Group id: %d. Got proposal key: %s",
-		n.Id, n.gid, proposal.Key)
+	span.Annotatef(nil, "node.applyCommitted Node id: %d. Group id: %d. Got proposal key: %d",
+		n.Id, n.gid, key)
+	if x.Debug {
+		glog.Infof("applyCommitted: Proposal: %+v\n", proposal)
+	}
 
 	if proposal.Mutations != nil {
 		// syncmarks for this shouldn't be marked done until it's committed.
 		span.Annotate(nil, "Applying mutations")
+		if x.Debug {
+			glog.Infof("applyCommitted: Mutation: %+v\n", proposal.Mutations)
+		}
 		if err := n.applyMutations(ctx, proposal); err != nil {
 			span.Annotatef(nil, "While applying mutations: %v", err)
 			return err
 		}
+
 		span.Annotate(nil, "Done")
 		return nil
 	}
@@ -356,19 +755,38 @@ func (n *node) applyCommitted(proposal *pb.Proposal) error {
 		return populateKeyValues(ctx, proposal.Kv)
 
 	case proposal.State != nil:
-		n.elog.Printf("Applying state for key: %s", proposal.Key)
+		n.elog.Printf("Applying state for key: %s", key)
 		// This state needn't be snapshotted in this group, on restart we would fetch
 		// a state which is latest or equal to this.
-		groups().applyState(proposal.State)
+		groups().applyState(groups().Node.Id, proposal.State)
 		return nil
 
 	case len(proposal.CleanPredicate) > 0:
 		n.elog.Printf("Cleaning predicate: %s", proposal.CleanPredicate)
-		return posting.DeletePredicate(ctx, proposal.CleanPredicate)
+		end := time.Now().Add(10 * time.Second)
+		for proposal.ExpectedChecksum > 0 && time.Now().Before(end) {
+			cur := atomic.LoadUint64(&groups().membershipChecksum)
+			if proposal.ExpectedChecksum == cur {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+			glog.Infof("Waiting for checksums to match. Expected: %d. Current: %d\n",
+				proposal.ExpectedChecksum, cur)
+		}
+		if time.Now().After(end) {
+			glog.Warningf(
+				"Giving up on predicate deletion: %q due to timeout. Wanted checksum: %d.",
+				proposal.CleanPredicate, proposal.ExpectedChecksum)
+			return nil
+		}
+		return posting.DeletePredicate(ctx, proposal.CleanPredicate, proposal.StartTs)
 
 	case proposal.Delta != nil:
-		n.elog.Printf("Applying Oracle Delta for key: %s", proposal.Key)
-		return n.commitOrAbort(proposal.Key, proposal.Delta)
+		n.elog.Printf("Applying Oracle Delta for key: %d", key)
+		if x.Debug {
+			glog.Infof("applyCommitted: Delta: %+v\n", proposal.Delta)
+		}
+		return n.commitOrAbort(key, proposal.Delta)
 
 	case proposal.Snapshot != nil:
 		existing, err := n.Store.Snapshot()
@@ -384,7 +802,7 @@ func (n *node) applyCommitted(proposal *pb.Proposal) error {
 			return nil
 		}
 		n.elog.Printf("Creating snapshot: %+v", snap)
-		glog.Infof("Creating snapshot at index: %d. ReadTs: %d.\n", snap.Index, snap.ReadTs)
+		glog.Infof("Creating snapshot at Index: %d, ReadTs: %d\n", snap.Index, snap.ReadTs)
 
 		data, err := snap.Marshal()
 		x.Check(err)
@@ -396,40 +814,81 @@ func (n *node) applyCommitted(proposal *pb.Proposal) error {
 			}
 			glog.Warningf("Error while calling CreateSnapshot: %v. Retrying...", err)
 		}
-		// Roll up all posting lists as a best-effort operation.
-		n.rollupCh <- snap.ReadTs
+		// We can now discard all invalid versions of keys below this ts.
+		pstore.SetDiscardTs(snap.ReadTs)
+		return nil
+	case proposal.Restore != nil:
+		// Enable draining mode for the duration of the restore processing.
+		x.UpdateDrainingMode(true)
+		defer x.UpdateDrainingMode(false)
+
+		var err error
+		var closer *z.Closer
+		closer, err = n.startTask(opRestore)
+		if err != nil {
+			return errors.Wrapf(err, "cannot start restore task")
+		}
+		defer closer.Done()
+
+		glog.Infof("Got restore proposal at Index:%d, ReadTs:%d",
+			proposal.Index, proposal.Restore.RestoreTs)
+		if err := handleRestoreProposal(ctx, proposal.Restore, proposal.Index); err != nil {
+			return err
+		}
+
+		// Call commitOrAbort to update the group checksums.
+		ts := proposal.Restore.RestoreTs
+		return n.commitOrAbort(key, &pb.OracleDelta{
+			Txns: []*pb.TxnStatus{
+				{StartTs: ts, CommitTs: ts},
+			},
+		})
+
+	case proposal.DeleteNs != nil:
+		x.AssertTrue(proposal.DeleteNs.Namespace != x.GalaxyNamespace)
+		n.elog.Printf("Deleting namespace: %d", proposal.DeleteNs.Namespace)
+		return posting.DeleteNamespace(proposal.DeleteNs.Namespace)
+
+	case proposal.CdcState != nil:
+		n.cdcTracker.updateCDCState(proposal.CdcState)
 		return nil
 	}
 	x.Fatalf("Unknown proposal: %+v", proposal)
 	return nil
 }
 
-func (n *node) processRollups() {
+func (n *node) processTabletSizes() {
 	defer n.closer.Done()                   // CLOSER:1
-	tick := time.NewTicker(5 * time.Minute) // Rolling up once every 5 minutes seems alright.
+	tick := time.NewTicker(5 * time.Minute) // Once every 5 minutes seems alright.
 	defer tick.Stop()
 
-	var readTs, last uint64
 	for {
 		select {
 		case <-n.closer.HasBeenClosed():
 			return
-		case readTs = <-n.rollupCh:
 		case <-tick.C:
-			glog.V(3).Infof("Evaluating rollup readTs:%d last:%d rollup:%v", readTs, last, readTs > last)
-			if readTs <= last {
-				break // Break out of the select case.
-			}
-			if err := n.rollupLists(readTs); err != nil {
-				// If we encounter error here, we don't need to do anything about
-				// it. Just let the user know.
-				glog.Errorf("Error while rolling up lists at %d: %v\n", readTs, err)
-			} else {
-				last = readTs // Update last only if we succeeded.
-				glog.Infof("List rollup at Ts %d: OK.\n", readTs)
-			}
+			n.calculateTabletSizes()
 		}
 	}
+}
+
+func getProposal(e raftpb.Entry) pb.Proposal {
+	var p pb.Proposal
+	key := binary.BigEndian.Uint64(e.Data[:8])
+	x.Check(p.Unmarshal(e.Data[8:]))
+	p.Key = key
+	p.Index = e.Index
+	switch {
+	case p.Mutations != nil:
+		p.StartTs = p.Mutations.StartTs
+	case p.Snapshot != nil:
+		p.StartTs = p.Snapshot.ReadTs
+	case p.Delta != nil:
+		p.StartTs = 0 // Run this asap.
+	default:
+		// For now, not covering everything.
+	}
+	return p
 }
 
 func (n *node) processApplyCh() {
@@ -440,71 +899,137 @@ func (n *node) processApplyCh() {
 		size int
 		seen time.Time
 	}
-	previous := make(map[string]*P)
+	previous := make(map[uint64]*P)
 
 	// This function must be run serially.
-	handle := func(proposals []*pb.Proposal) {
-		var totalSize int64
-		for _, proposal := range proposals {
-			// We use the size as a double check to ensure that we're
-			// working with the same proposal as before.
-			psz := proposal.Size()
-			totalSize += int64(psz)
+	handle := func(prop pb.Proposal) {
+		var perr error
+		prev, ok := previous[prop.Key]
+		if ok && prev.err == nil {
+			n.elog.Printf("Proposal with key: %d already applied. Skipping index: %d.\n",
+				prop.Key, prop.Index)
+			previous[prop.Key].seen = time.Now() // Update the ts.
+			// Don't break here. We still need to call the Done below.
 
-			var perr error
-			p, ok := previous[proposal.Key]
-			if ok && p.err == nil && p.size == psz {
-				n.elog.Printf("Proposal with key: %s already applied. Skipping index: %d.\n",
-					proposal.Key, proposal.Index)
-				previous[proposal.Key].seen = time.Now() // Update the ts.
-				// Don't break here. We still need to call the Done below.
-
-			} else {
-				start := time.Now()
-				perr = n.applyCommitted(proposal)
-				if len(proposal.Key) > 0 {
-					p := &P{err: perr, size: psz, seen: time.Now()}
-					previous[proposal.Key] = p
+		} else {
+			if max := posting.Oracle().MaxAssigned(); prop.StartTs > max {
+				// Wait to run this proposal.
+				if x.Debug {
+					glog.Infof("start ts: %d max: %d. Pushing to pending.\n", prop.StartTs, max)
 				}
-				if perr != nil {
-					glog.Errorf("Applying proposal. Error: %v. Proposal: %q.", perr, proposal)
-				}
-				n.elog.Printf("Applied proposal with key: %s, index: %d. Err: %v",
-					proposal.Key, proposal.Index, perr)
-
-				var tags []tag.Mutator
-				switch {
-				case proposal.Mutations != nil:
-					tags = append(tags, tag.Upsert(x.KeyMethod, "apply.Mutations"))
-				case proposal.Delta != nil:
-					tags = append(tags, tag.Upsert(x.KeyMethod, "apply.Delta"))
-				}
-				ms := x.SinceMs(start)
-				_ = ostats.RecordWithTags(context.Background(), tags, x.LatencyMs.M(ms))
+				n.pendingProposals = append(n.pendingProposals, prop)
+				return
 			}
 
-			n.Proposals.Done(proposal.Key, perr)
-			n.Applied.Done(proposal.Index)
-			ostats.Record(context.Background(), x.RaftAppliedIndex.M(int64(n.Applied.DoneUntil())))
+			// if this applyCommited fails, how do we ensure
+			start := time.Now()
+			perr = n.applyCommitted(&prop)
+			if prop.Key != 0 {
+				p := &P{err: perr, seen: time.Now()}
+				previous[prop.Key] = p
+			}
+			if perr != nil {
+				glog.Errorf("Applying proposal. Error: %v. Proposal: %q.", perr,
+					getSanitizedString(&prop))
+			}
+			n.elog.Printf("Applied proposal with key: %d, index: %d. Err: %v",
+				prop.Key, prop.Index, perr)
+
+			var tags []tag.Mutator
+			switch {
+			case prop.Mutations != nil:
+				if len(prop.Mutations.Schema) == 0 {
+					// Don't capture schema updates.
+					tags = append(tags, tag.Upsert(x.KeyMethod, "apply.Mutations"))
+				}
+			case prop.Delta != nil:
+				tags = append(tags, tag.Upsert(x.KeyMethod, "apply.Delta"))
+			}
+			ms := x.SinceMs(start)
+			if err := ostats.RecordWithTags(context.Background(),
+				tags, x.LatencyMs.M(ms)); err != nil {
+				glog.Errorf("Error recording stats: %+v", err)
+			}
 		}
-		if sz := atomic.AddInt64(&n.pendingSize, -totalSize); sz < 0 {
-			glog.Warningf("Pending size should remain above zero: %d", sz)
+
+		n.Proposals.Done(prop.Key, perr)
+		n.Applied.Done(prop.Index)
+		ostats.Record(context.Background(), x.RaftAppliedIndex.M(int64(n.Applied.DoneUntil())))
+	}
+
+	loopOverPending := func(maxAssigned uint64) {
+		idx := 0
+		for idx < len(n.pendingProposals) {
+			p := n.pendingProposals[idx]
+			if maxAssigned >= p.StartTs {
+				handle(p)
+				n.pendingProposals = append(n.pendingProposals[:idx], n.pendingProposals[idx+1:]...)
+			} else {
+				idx++
+			}
 		}
 	}
 
-	maxAge := 10 * time.Minute
+	maxAge := 2 * time.Minute
 	tick := time.NewTicker(maxAge / 2)
 	defer tick.Stop()
 
+	var counter int
+	var maxAssigned uint64
+	orc := posting.Oracle()
 	for {
 		select {
+		case <-n.drainApplyCh:
+			numDrained := 0
+			for _, p := range n.pendingProposals {
+				numDrained++
+				n.Proposals.Done(p.Key, nil)
+				n.Applied.Done(p.Index)
+			}
+			n.pendingProposals = n.pendingProposals[:0]
+
+			var done bool
+			for !done {
+				select {
+				case entries := <-n.applyCh:
+					numDrained += len(entries)
+					for _, entry := range entries {
+						key := binary.BigEndian.Uint64(entry.Data[:8])
+						n.Proposals.Done(key, nil)
+						n.Applied.Done(entry.Index)
+					}
+				default:
+					done = true
+				}
+			}
+			glog.Infof("Drained %d entries. Size of applyCh: %d\n", numDrained, len(n.applyCh))
+
 		case entries, ok := <-n.applyCh:
 			if !ok {
 				return
 			}
-			handle(entries)
+			var totalSize int64
+			for _, e := range entries {
+				x.AssertTrue(len(e.Data) > 0)
+				p := getProposal(e)
+				handle(p)
+
+				if p.Delta != nil && len(n.pendingProposals) > 0 {
+					// MaxAssigned would only change during deltas.
+					if max := orc.MaxAssigned(); max > maxAssigned {
+						loopOverPending(max)
+						maxAssigned = max
+					}
+				}
+				totalSize += int64(e.Size())
+			}
+			if sz := atomic.AddInt64(&n.pendingSize, -totalSize); sz < 0 {
+				glog.Warningf("Pending size should remain above zero: %d", sz)
+			}
+
 		case <-tick.C:
 			// We use this ticker to clear out previous map.
+			counter++
 			now := time.Now()
 			for key, p := range previous {
 				if now.Sub(p.seen) > maxAge {
@@ -512,41 +1037,131 @@ func (n *node) processApplyCh() {
 				}
 			}
 			n.elog.Printf("Size of previous map: %d", len(previous))
+
+			kw := n.keysWritten
+			minSeen := posting.Oracle().MinMaxAssignedSeenTs()
+			before := len(kw.keyCommitTs)
+			for k, commitTs := range kw.keyCommitTs {
+				// If commitTs is less than the min of all pending Txn's MaxAssignedSeen, then we
+				// can safely delete the key. StillValid would only consider the commits with ts >
+				// MaxAssignedSeen.
+				if commitTs < minSeen {
+					delete(kw.keyCommitTs, k)
+				}
+			}
+			if counter%5 == 0 {
+				// Once in 5 minutes.
+				glog.V(2).Infof("Still valid: %d Invalid: %d. Size of commit map: %d -> %d."+
+					" Total keys written: %d\n",
+					kw.validTxns, kw.invalidTxns, before, len(kw.keyCommitTs), kw.totalKeys)
+			}
 		}
 	}
 }
 
-func (n *node) commitOrAbort(pkey string, delta *pb.OracleDelta) error {
-	// First let's commit all mutations to disk.
-	writer := posting.NewTxnWriter(pstore)
-	toDisk := func(start, commit uint64) {
-		txn := posting.Oracle().GetTxn(start)
-		if txn == nil {
-			return
-		}
-		txn.Update()
-		err := x.RetryUntilSuccess(x.WorkerConfig.MaxRetries, 10*time.Millisecond, func() error {
-			return txn.CommitToDisk(writer, commit)
-		})
+func (n *node) commitOrAbort(_ uint64, delta *pb.OracleDelta) error {
+	_, span := otrace.StartSpan(context.Background(), "node.commitOrAbort")
+	defer span.End()
 
-		if err != nil {
-			glog.Errorf("Error while applying txn status to disk (%d -> %d): %v",
-				start, commit, err)
-		}
-	}
+	span.Annotate(nil, "Start")
+	start := time.Now()
+	var numKeys int
 
+	itrStart := time.Now()
+	var itrs []y.Iterator
+	var txns []*posting.Txn
+	var sz int64
 	for _, status := range delta.Txns {
-		toDisk(status.StartTs, status.CommitTs)
+		txn := posting.Oracle().GetTxn(status.StartTs)
+		if txn == nil {
+			continue
+		}
+		for k := range txn.Deltas() {
+			n.keysWritten.keyCommitTs[z.MemHashString(k)] = status.CommitTs
+		}
+		n.keysWritten.totalKeys += len(txn.Deltas())
+		numKeys += len(txn.Deltas())
+		if len(txn.Deltas()) == 0 {
+			continue
+		}
+		txns = append(txns, txn)
+
+		sz += txn.Skiplist().MemSize()
+		// Iterate to set the commit timestamp for all keys.
+		// Skiplist can block if the conversion to Skiplist isn't done yet.
+		itr := txn.Skiplist().NewIterator()
+		for itr.SeekToFirst(); itr.Valid(); itr.Next() {
+			key := itr.Key()
+			// We don't expect the ordering of the keys to change due to setting their commit
+			// timestamps. Each key in the skiplist should be unique already.
+			y.SetKeyTs(key, status.CommitTs)
+		}
+		itr.Close()
+
+		itrs = append(itrs, txn.Skiplist().NewUniIterator(false))
 	}
-	if err := writer.Flush(); err != nil {
-		return errors.Wrapf(err, "while flushing to disk")
+	span.Annotatef(nil, "Num keys: %d Itr: %s\n", numKeys, time.Since(itrStart))
+	ostats.Record(n.ctx, x.NumEdges.M(int64(numKeys)))
+
+	// This would be used for callback via Badger when skiplist is pushed to
+	// disk.
+	deleteTxns := func() {
+		posting.Oracle().DeleteTxns(delta)
 	}
+
+	if len(itrs) == 0 {
+		deleteTxns()
+
+	} else {
+		sn := time.Now()
+		mi := table.NewMergeIterator(itrs, false)
+		mi.Rewind()
+
+		var keys int
+		b := skl.NewBuilder(int64(float64(sz) * 1.1))
+		for mi.Valid() {
+			b.Add(mi.Key(), mi.Value())
+			keys++
+			mi.Next()
+		}
+		span.Annotatef(nil, "Iterating and skiplist over %d keys took: %s", keys, time.Since(sn))
+		err := x.RetryUntilSuccess(3600, time.Second, func() error {
+			if numKeys == 0 {
+				return nil
+			}
+			// We do the pending txn deletion in the callback, so that our snapshot and checkpoint
+			// tracking would only consider the txns which have been successfully pushed to disk.
+			return pstore.HandoverSkiplist(b.Skiplist(), deleteTxns)
+		})
+		if err != nil {
+			glog.Errorf("while handing over skiplist: %v\n", err)
+		}
+		span.Annotatef(nil, "Handover skiplist done for %d txns, %d keys", len(delta.Txns), numKeys)
+	}
+
+	ms := x.SinceMs(start)
+	tags := []tag.Mutator{tag.Upsert(x.KeyMethod, "apply.toDisk")}
+	x.Check(ostats.RecordWithTags(context.Background(), tags, x.LatencyMs.M(ms)))
+
+	// Before, we used to call pstore.Sync() here. We don't need to do that
+	// anymore because we're not using Badger's WAL.
 
 	g := groups()
-	atomic.StoreUint64(&g.deltaChecksum, delta.GroupChecksums[g.groupId()])
+	if delta.GroupChecksums != nil && delta.GroupChecksums[g.groupId()] > 0 {
+		atomic.StoreUint64(&g.deltaChecksum, delta.GroupChecksums[g.groupId()])
+	}
+
+	// Clear all the cached lists that were touched by this transaction.
+	for _, status := range delta.Txns {
+		txn := posting.Oracle().GetTxn(status.StartTs)
+		txn.RemoveCachedKeys()
+	}
+	posting.WaitForCache()
+	span.Annotate(nil, "cache keys removed")
 
 	// Now advance Oracle(), so we can service waiting reads.
 	posting.Oracle().ProcessDelta(delta)
+	span.Annotate(nil, "process delta done")
 	return nil
 }
 
@@ -580,6 +1195,12 @@ func (n *node) Snapshot() (*pb.Snapshot, error) {
 }
 
 func (n *node) retrieveSnapshot(snap pb.Snapshot) error {
+	closer, err := n.startTask(opSnapshot)
+	if err != nil {
+		return err
+	}
+	defer closer.Done()
+
 	// In some edge cases, the Zero leader might not have been able to update
 	// the status of Alpha leader. So, instead of blocking forever on waiting
 	// for Zero to send us the updates info about the leader, we can just use
@@ -613,7 +1234,7 @@ func (n *node) retrieveSnapshot(snap pb.Snapshot) error {
 	// commits up until then have already been written to pstore. And the way we take snapshots, we
 	// keep all the pre-writes for a pending transaction, so they will come back to memory, as Raft
 	// logs are replayed.
-	if _, err := n.populateSnapshot(snap, pool); err != nil {
+	if err := n.populateSnapshot(snap, pool); err != nil {
 		return errors.Wrapf(err, "cannot retrieve snapshot from peer")
 	}
 	// Populate shard stores the streamed data directly into db, so we need to refresh
@@ -622,11 +1243,44 @@ func (n *node) retrieveSnapshot(snap pb.Snapshot) error {
 		return errors.Wrapf(err, "while initializing schema")
 	}
 	groups().triggerMembershipSync()
+	// We set MaxAssignedTs to avoid this case. Right after snapshot, say we have mutation and its
+	// commit. Without a MaxAssigned >= mutation.StartTs, we would enqueue it in pendingProposals.
+	// But, then go an execute its commit. That would result in mutation loss. To avoid that, we
+	// calculate the MaxAssigned and set it corresponding to the snapshot. So, we can apply the
+	// mutation before its commit when we replay logs.
+	posting.Oracle().SetMaxAssigned(snap.MaxAssigned)
 	return nil
 }
 
-func (n *node) proposeSnapshot(discardN int) error {
-	snap, err := n.calculateSnapshot(0, discardN)
+func (n *node) proposeCDCState(ts uint64) error {
+	proposal := &pb.Proposal{
+		CdcState: &pb.CDCState{
+			SentTs: ts,
+		},
+	}
+	glog.V(2).Infof("Proposing new CDC state ts: %d\n", ts)
+	data := make([]byte, 8+proposal.Size())
+	sz, err := proposal.MarshalToSizedBuffer(data[8:])
+	data = data[:8+sz]
+	x.Check(err)
+	return n.Raft().Propose(n.ctx, data)
+}
+
+func (n *node) proposeSnapshot() error {
+	lastIdx := x.Min(n.Applied.DoneUntil(), n.cdcTracker.getSeenIndex())
+	// We can't rely upon the Raft entries to determine the minPendingStart,
+	// because there are many cases during mutations where we don't commit or
+	// abort the transaction. This might happen due to an early error thrown.
+	// Only the mutations which make it to Zero for a commit/abort decision have
+	// corresponding Delta entries. So, instead of replicating all that logic
+	// here, we just use the MinPendingStartTs tracked by the Oracle, and look
+	// for that in the logs.
+	//
+	// So, we iterate over logs. If we hit MinPendingStartTs, that generates our
+	// snapshotIdx. In any case, we continue picking up txn updates, to generate
+	// a maxCommitTs, which would become the readTs for the snapshot.
+	minPendingStart := x.Min(posting.Oracle().MinPendingStartTs(), n.cdcTracker.getTs())
+	snap, err := n.calculateSnapshot(0, lastIdx, minPendingStart)
 	if err != nil {
 		return err
 	}
@@ -636,23 +1290,28 @@ func (n *node) proposeSnapshot(discardN int) error {
 	proposal := &pb.Proposal{
 		Snapshot: snap,
 	}
-	n.elog.Printf("Proposing snapshot: %+v\n", snap)
-	data, err := proposal.Marshal()
+	glog.V(2).Infof("Proposing snapshot: %+v\n", snap)
+	data := make([]byte, 8+proposal.Size())
+	sz, err := proposal.MarshalToSizedBuffer(data[8:])
+	data = data[:8+sz]
 	x.Check(err)
 	return n.Raft().Propose(n.ctx, data)
 }
 
-const maxPendingSize int64 = 64 << 20 // in bytes.
+const (
+	maxPendingSize int64 = 256 << 20 // in bytes.
+	nodeApplyChan        = "pushing to raft node applyCh"
+)
 
-func (n *node) rampMeter() {
+func rampMeter(address *int64, maxSize int64, component string) {
 	start := time.Now()
 	defer func() {
 		if dur := time.Since(start); dur > time.Second {
-			glog.Infof("Blocked pushing to applyCh for %v", dur.Round(time.Millisecond))
+			glog.Infof("Blocked %s for %v", component, dur.Round(time.Millisecond))
 		}
 	}()
 	for {
-		if atomic.LoadInt64(&n.pendingSize) <= maxPendingSize {
+		if atomic.LoadInt64(address) <= maxSize {
 			return
 		}
 		time.Sleep(3 * time.Millisecond)
@@ -666,27 +1325,52 @@ func (n *node) updateRaftProgress() error {
 	//
 	// Let's check what we already have. And only update if the new snap.Index is ahead of the last
 	// stored applied.
-	applied, err := n.Store.Checkpoint()
-	if err != nil {
-		return err
-	}
+	applied := n.Store.Uint(raftwal.CheckpointIndex)
 
-	snap, err := n.calculateSnapshot(applied, 3) // 3 is a randomly chosen small number.
+	snap, err := n.calculateSnapshot(applied, n.Applied.DoneUntil(),
+		posting.Oracle().MinPendingStartTs())
 	if err != nil || snap == nil || snap.Index <= applied {
 		return err
 	}
+	atomic.StoreUint64(&n.checkpointTs, snap.ReadTs)
 
-	if err := n.Store.UpdateCheckpoint(snap); err != nil {
-		return err
-	}
-	glog.V(2).Infof("[%#x] Set Raft progress to index: %d.", n.Id, snap.Index)
+	n.Store.SetUint(raftwal.CheckpointIndex, snap.GetIndex())
+	glog.V(2).Infof("[%#x] Set Raft checkpoint to index: %d, ts: %d.",
+		n.Id, snap.Index, snap.ReadTs)
 	return nil
 }
 
 func (n *node) checkpointAndClose(done chan struct{}) {
+	snapshotAfterEntries := x.WorkerConfig.Raft.GetUint64("snapshot-after-entries")
+	x.AssertTruef(snapshotAfterEntries > 10, "raft.snapshot-after must be a number greater than 10")
+
 	slowTicker := time.NewTicker(time.Minute)
 	defer slowTicker.Stop()
 
+	exceededSnapshotByEntries := func() bool {
+		if snapshotAfterEntries == 0 {
+			// If snapshot-after isn't set, return true always.
+			return true
+		}
+		chk, err := n.Store.Checkpoint()
+		if err != nil {
+			glog.Errorf("While reading checkpoint: %v", err)
+			return false
+		}
+		first, err := n.Store.FirstIndex()
+		if err != nil {
+			glog.Errorf("While reading first index: %v", err)
+			return false
+		}
+		// If we're over snapshotAfterEntries, calculate would be true.
+		glog.V(3).Infof("Evaluating snapshot first:%d chk:%d (chk-first:%d) "+
+			"snapshotAfterEntries:%d", first, chk, chk-first,
+			snapshotAfterEntries)
+		return chk-first >= snapshotAfterEntries
+	}
+
+	lastSnapshotTime := time.Now()
+	snapshotFrequency := x.WorkerConfig.Raft.GetDuration("snapshot-after-duration")
 	for {
 		select {
 		case <-slowTicker.C:
@@ -699,17 +1383,41 @@ func (n *node) checkpointAndClose(done chan struct{}) {
 			}
 
 			if n.AmLeader() {
-				var calculate bool
-				if chk, err := n.Store.Checkpoint(); err == nil {
-					if first, err := n.Store.FirstIndex(); err == nil {
-						// Save some cycles by only calculating snapshot if the checkpoint has gone
-						// quite a bit further than the first index.
-						calculate = chk >= first+uint64(x.WorkerConfig.SnapshotAfter)
-						glog.V(3).Infof("Evaluating snapshot first:%d chk:%d (chk-first:%d) "+
-							"snapshotAfter:%d snap:%v", first, chk, chk-first,
-							x.WorkerConfig.SnapshotAfter, calculate)
-					}
+				// If leader doesn't have a snapshot, we should create one immediately. This is very
+				// useful when you bring up the cluster from bulk loader. If you remove an alpha and
+				// add a new alpha, the new follower won't get a snapshot if the leader doesn't have
+				// one.
+				snap, err := n.Store.Snapshot()
+				if err != nil {
+					glog.Errorf("While retrieving snapshot from Store: %v\n", err)
+					continue
 				}
+
+				// calculate would be true if:
+				// - snapshot is empty [#0]
+				// - we have more than 4 log files in Raft WAL [#0]
+				//
+				// If snapshot entries is set (no frequency):
+				// - Just use entries [#1]
+				//
+				// If snapshot frequency is set (no entries):
+				// - Just use frequency based threshold time [#2]
+				//
+				// If both entries and frequency is set:
+				// - Take a snapshot after BOTH time and entries are exceeded [#3]
+				//
+				// Note: In case we're exceeding threshold entries, but have not exceeded the
+				// threshold time since last snapshot, calculate would be false.
+				calculate := raft.IsEmptySnap(snap) || n.Store.NumLogFiles() > 4 // #0
+				if snapshotFrequency == 0 {
+					calculate = calculate || exceededSnapshotByEntries() // #1
+
+				} else if time.Since(lastSnapshotTime) > snapshotFrequency {
+					// If we haven't taken a snapshot since snapshotFrequency, calculate would
+					// follow snapshot entries.
+					calculate = calculate || exceededSnapshotByEntries() // #2, #3
+				}
+
 				// We keep track of the applied index in the p directory. Even if we don't take
 				// snapshot for a while and let the Raft logs grow and restart, we would not have to
 				// run all the log entries, because we can tell Raft.Config to set Applied to that
@@ -722,8 +1430,13 @@ func (n *node) checkpointAndClose(done chan struct{}) {
 				// snapshotting.  We just need to do enough, so that we don't have a huge backlog of
 				// entries to process on a restart.
 				if calculate {
-					if err := n.proposeSnapshot(x.WorkerConfig.SnapshotAfter); err != nil {
+					// We can set discardN argument to zero, because we already know that calculate
+					// would be true if either we absolutely needed to calculate the snapshot,
+					// or our checkpoint already crossed the SnapshotAfter threshold.
+					if err := n.proposeSnapshot(); err != nil {
 						glog.Errorf("While calculating and proposing snapshot: %v", err)
+					} else {
+						lastSnapshotTime = time.Now()
 					}
 				}
 				go n.abortOldTransactions()
@@ -732,7 +1445,7 @@ func (n *node) checkpointAndClose(done chan struct{}) {
 		case <-n.closer.HasBeenClosed():
 			glog.Infof("Stopping node.Run")
 			if peerId, has := groups().MyPeer(); has && n.AmLeader() {
-				n.Raft().TransferLeadership(n.ctx, x.WorkerConfig.RaftId, peerId)
+				n.Raft().TransferLeadership(n.ctx, n.Id, peerId)
 				time.Sleep(time.Second) // Let transfer happen.
 			}
 			n.Raft().Stop()
@@ -742,23 +1455,16 @@ func (n *node) checkpointAndClose(done chan struct{}) {
 	}
 }
 
-func (n *node) drainApplyChan() {
-	for {
-		select {
-		case proposals := <-n.applyCh:
-			glog.Infof("Draining %d proposals\n", len(proposals))
-			for _, proposal := range proposals {
-				n.Proposals.Done(proposal.Key, nil)
-				n.Applied.Done(proposal.Index)
-			}
-		default:
-			return
-		}
-	}
-}
+const tickDur = 100 * time.Millisecond
 
 func (n *node) Run() {
 	defer n.closer.Done() // CLOSER:1
+
+	// lastLead is for detecting leadership changes
+	//
+	// etcd has a similar mechanism for tracking leader changes, with their
+	// raftReadyHandler.getLead() function that returns the previous leader
+	lastLead := uint64(math.MaxUint64)
 
 	firstRun := true
 	var leader bool
@@ -767,18 +1473,25 @@ func (n *node) Run() {
 	// "tick missed to fire" logs. Etcd uses 100ms and they haven't seen those issues.
 	// Additionally, using 100ms for ticks does not cause proposals to slow down, because they get
 	// sent out asap and don't rely on ticks. So, setting this to 100ms instead of 20ms is a NOOP.
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(tickDur)
 	defer ticker.Stop()
 
 	done := make(chan struct{})
 	go n.checkpointAndClose(done)
 	go n.ReportRaftComms()
 
+	if !x.WorkerConfig.HardSync {
+		closer := z.NewCloser(2)
+		defer closer.SignalAndWait()
+		go x.StoreSync(n.Store, closer)
+		go x.StoreSync(pstore, closer)
+	}
+
 	applied, err := n.Store.Checkpoint()
 	if err != nil {
 		glog.Errorf("While trying to find raft progress: %v", err)
 	} else {
-		glog.Infof("Found Raft progress: %d", applied)
+		glog.Infof("Found Raft checkpoint: %d", applied)
 	}
 
 	var timer x.Timer
@@ -807,6 +1520,23 @@ func (n *node) Run() {
 			if rd.SoftState != nil {
 				groups().triggerMembershipSync()
 				leader = rd.RaftState == raft.StateLeader
+				// create context with group id
+				ctx, _ := tag.New(n.ctx, tag.Upsert(x.KeyGroup, fmt.Sprintf("%d", n.gid)))
+				// detect leadership changes
+				if rd.SoftState.Lead != lastLead {
+					lastLead = rd.SoftState.Lead
+					ostats.Record(ctx, x.RaftLeaderChanges.M(1))
+				}
+				if rd.SoftState.Lead != raft.None {
+					ostats.Record(ctx, x.RaftHasLeader.M(1))
+				} else {
+					ostats.Record(ctx, x.RaftHasLeader.M(0))
+				}
+				if leader {
+					ostats.Record(ctx, x.RaftIsLeader.M(1))
+				} else {
+					ostats.Record(ctx, x.RaftIsLeader.M(0))
+				}
 			}
 			if leader {
 				// Leader can send messages in parallel with writing to disk.
@@ -847,7 +1577,7 @@ func (n *node) Run() {
 					maxIndex := n.Applied.LastIndex()
 					glog.Infof("Drain applyCh by reaching %d before"+
 						" retrieving snapshot\n", maxIndex)
-					n.drainApplyChan()
+					n.drainApplyCh <- struct{}{}
 
 					if err := n.Applied.WaitForMark(context.Background(), maxIndex); err != nil {
 						glog.Errorf("Error waiting for mark for index %d: %+v", maxIndex, err)
@@ -873,7 +1603,7 @@ func (n *node) Run() {
 							break
 						}
 						glog.Errorf("While retrieving snapshot, error: %v. Retrying...", err)
-						time.Sleep(100 * time.Millisecond) // Wait for a bit.
+						time.Sleep(time.Second) // Wait for a bit.
 					}
 					glog.Infof("---> SNAPSHOT: %+v. Group %d. DONE.\n", snap, n.gid)
 
@@ -889,23 +1619,26 @@ func (n *node) Run() {
 			}
 
 			// Store the hardstate and entries. Note that these are not CommittedEntries.
-			n.SaveToStorage(rd.HardState, rd.Entries, rd.Snapshot)
+			n.SaveToStorage(&rd.HardState, rd.Entries, &rd.Snapshot)
 			timer.Record("disk")
-			if rd.MustSync {
-				if err := n.Store.Sync(); err != nil {
-					glog.Errorf("Error while calling Store.Sync: %+v", err)
-				}
-				timer.Record("sync")
-			}
 			if span != nil {
 				span.Annotatef(nil, "Saved %d entries. Snapshot, HardState empty? (%v, %v)",
 					len(rd.Entries),
 					raft.IsEmptySnap(rd.Snapshot),
 					raft.IsEmptyHardState(rd.HardState))
 			}
+			for x.WorkerConfig.HardSync && rd.MustSync {
+				if err := n.Store.Sync(); err != nil {
+					glog.Errorf("Error while calling Store.Sync: %+v", err)
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				timer.Record("sync")
+				break
+			}
 
 			// Now schedule or apply committed entries.
-			var proposals []*pb.Proposal
+			var entries []raftpb.Entry
 			for _, entry := range rd.CommittedEntries {
 				// Need applied watermarks for schema mutation also for read linearazibility
 				// Applied watermarks needs to be emitted as soon as possible sequentially.
@@ -928,34 +1661,71 @@ func (n *node) Run() {
 					n.elog.Printf("Skipping over already applied entry: %d", entry.Index)
 					n.Applied.Done(entry.Index)
 				default:
-					proposal := &pb.Proposal{}
-					if err := proposal.Unmarshal(entry.Data); err != nil {
-						x.Fatalf("Unable to unmarshal proposal: %v %q\n", err, entry.Data)
-					}
-					if pctx := n.Proposals.Get(proposal.Key); pctx != nil {
+					key := binary.BigEndian.Uint64(entry.Data[:8])
+					if pctx := n.Proposals.Get(key); pctx != nil {
 						atomic.AddUint32(&pctx.Found, 1)
 						if span := otrace.FromContext(pctx.Ctx); span != nil {
 							span.Annotate(nil, "Proposal found in CommittedEntries")
 						}
 					}
-					proposal.Index = entry.Index
-					proposals = append(proposals, proposal)
+					entries = append(entries, entry)
 				}
 			}
 			// Send the whole lot to applyCh in one go, instead of sending proposals one by one.
-			if len(proposals) > 0 {
+			if len(entries) > 0 {
 				// Apply the meter this before adding size to pending size so some crazy big
-				// proposal can be pushed to applyCh. If this do this after adding its size to
+				// proposal can be pushed to applyCh. If we do this after adding its size to
 				// pending size, we could block forever in rampMeter.
-				n.rampMeter()
+				rampMeter(&n.pendingSize, maxPendingSize, nodeApplyChan)
 				var pendingSize int64
-				for _, p := range proposals {
-					pendingSize += int64(p.Size())
+				for _, e := range entries {
+					pendingSize += int64(e.Size())
 				}
 				if sz := atomic.AddInt64(&n.pendingSize, pendingSize); sz > 2*maxPendingSize {
 					glog.Warningf("Inflight proposal size: %d. There would be some throttling.", sz)
 				}
-				n.applyCh <- proposals
+
+				for _, e := range entries {
+					p := getProposal(e)
+					if len(p.Mutations.GetEdges()) == 0 {
+						continue
+					}
+					var skip bool
+					for _, e := range p.Mutations.GetEdges() {
+						// This is a drop predicate mutation. We should not try to execute it
+						// concurrently.
+						if e.Entity == 0 && bytes.Equal(e.Value, []byte(x.Star)) {
+							skip = true
+							break
+						}
+					}
+					if skip {
+						continue
+					}
+					// We should register this txn before sending it over for concurrent
+					// application.
+					txn, has := posting.Oracle().RegisterStartTs(p.StartTs)
+					if x.Debug {
+						glog.Infof("Registered start ts: %d txn: %p. has: %v. mutation: %+v\n",
+							p.StartTs, txn, has, p.Mutations)
+					}
+
+					if has {
+						// We have already registered this txn before. That means, this txn would
+						// either have already been run via apply channel, or would be on its way.
+						// It could even be currently being executed via concurrent mutation
+						// workers.  Moreover, in concurrent execution, when MaxAssigned <
+						// txn.StartTs, we might have to waste the work done, and reset the txn.
+						// To avoid edge cases, it is just simpler to NOT run the txn mutation
+						// concurrently.
+						// There's an optimization here where if startTs < MaxAssigned, then we
+						// could run it concurrently. But, we won't use that to avoid complexity of
+						// figuring out whether we set it up for concurrent execution or serial.
+					} else {
+						n.concApplyCh <- &p
+					}
+				}
+				n.applyCh <- entries
 			}
 
 			if span != nil {
@@ -994,7 +1764,7 @@ func (n *node) Run() {
 					glog.Errorf("Error recording stats: %+v", err)
 				}
 			}
-			if timer.Total() > 200*time.Millisecond {
+			if timer.Total() > 5*tickDur {
 				glog.Warningf(
 					"Raft.Ready took too long to process: %s"+
 						" Num entries: %d. MustSync: %v",
@@ -1008,114 +1778,75 @@ func listWrap(kv *bpb.KV) *bpb.KVList {
 	return &bpb.KVList{Kv: []*bpb.KV{kv}}
 }
 
-// rollupLists would consolidate all the deltas that constitute one posting
-// list, and write back a complete posting list.
-func (n *node) rollupLists(readTs uint64) error {
-	writer := posting.NewTxnWriter(pstore)
-
-	// We're doing rollups. We should use this opportunity to calculate the tablet sizes.
-	amLeader := n.AmLeader()
-	m := new(sync.Map)
-
-	addTo := func(key []byte, delta int64) {
-		if !amLeader {
-			// Only leader needs to calculate the tablet sizes.
-			return
-		}
-		pk, err := x.Parse(key)
-		if err != nil {
-			glog.Errorf("Error while parsing key %s: %v", hex.Dump(key), err)
-			return
-		}
-		val, ok := m.Load(pk.Attr)
-		if !ok {
-			sz := new(int64)
-			val, _ = m.LoadOrStore(pk.Attr, sz)
-		}
-		size := val.(*int64)
-		atomic.AddInt64(size, delta)
-	}
-
-	stream := pstore.NewStreamAt(readTs)
-	stream.LogPrefix = "Rolling up"
-	stream.ChooseKey = func(item *badger.Item) bool {
-		switch item.UserMeta() {
-		case posting.BitSchemaPosting, posting.BitCompletePosting, posting.BitEmptyPosting:
-			addTo(item.Key(), item.EstimatedSize())
-			return false
-		case x.ByteUnused:
-			return false
-		default:
-			return true
-		}
-	}
-	var numKeys uint64
-	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
-		l, err := posting.ReadPostingList(key, itr)
-		if err != nil {
-			return nil, err
-		}
-		atomic.AddUint64(&numKeys, 1)
-		kvs, err := l.Rollup()
-
-		// If there are multiple keys, the posting list was split into multiple
-		// parts. The key of the first part is the right key to use for tablet
-		// size calculations.
-		for _, kv := range kvs {
-			addTo(kvs[0].Key, int64(kv.Size()))
-		}
-
-		return &bpb.KVList{Kv: kvs}, err
-	}
-	stream.Send = func(list *bpb.KVList) error {
-		return writer.Write(list)
-	}
-	if err := stream.Orchestrate(context.Background()); err != nil {
-		return err
-	}
-	if err := writer.Flush(); err != nil {
-		return err
-	}
-	// For all the keys, let's see if they're in the LRU cache. If so, we can roll them up.
-	glog.Infof("Rolled up %d keys. Done", atomic.LoadUint64(&numKeys))
-
-	// We can now discard all invalid versions of keys below this ts.
-	pstore.SetDiscardTs(readTs)
-
-	if amLeader {
+// calculateTabletSizes updates the tablet sizes for the keys.
+func (n *node) calculateTabletSizes() {
+	if !n.AmLeader() {
 		// Only leader sends the tablet size updates to Zero. No one else does.
-		// doSendMembership is also being concurrently called from another goroutine.
-		go func() {
-			tablets := make(map[string]*pb.Tablet)
-			var total int64
-			m.Range(func(key, val interface{}) bool {
-				pred := key.(string)
-				size := atomic.LoadInt64(val.(*int64))
-				tablets[pred] = &pb.Tablet{
-					GroupId:   n.gid,
-					Predicate: pred,
-					Space:     size,
-				}
-				total += size
-				return true
-			})
-			// Update Zero with the tablet sizes. If Zero sees a tablet which does not belong to
-			// this group, it would send instruction to delete that tablet. There's an edge case
-			// here if the followers are still running Rollup, and happen to read a key before and
-			// write after the tablet deletion, causing that tablet key to resurface. Then, only the
-			// follower would have that key, not the leader.
-			// However, if the follower then becomes the leader, we'd be able to get rid of that
-			// key then. Alternatively, we could look into cancelling the Rollup if we see a
-			// predicate deletion.
-			if err := groups().doSendMembership(tablets); err != nil {
-				glog.Warningf("While sending membership to Zero. Error: %v", err)
-			} else {
-				glog.V(2).Infof("Sent tablet size update to Zero. Total size: %s",
-					humanize.Bytes(uint64(total)))
-			}
-		}()
+		return
 	}
-	return nil
+	var total int64
+	tablets := make(map[string]*pb.Tablet)
+	updateSize := func(tinfo badger.TableInfo) {
+		// The error has already been checked by caller.
+		left, _ := x.Parse(tinfo.Left)
+		pred := left.Attr
+		if pred == "" {
+			return
+		}
+		if tablet, ok := tablets[pred]; ok {
+			tablet.OnDiskBytes += int64(tinfo.OnDiskSize)
+			tablet.UncompressedBytes += int64(tinfo.UncompressedSize)
+		} else {
+			tablets[pred] = &pb.Tablet{
+				GroupId:           n.gid,
+				Predicate:         pred,
+				OnDiskBytes:       int64(tinfo.OnDiskSize),
+				UncompressedBytes: int64(tinfo.UncompressedSize),
+			}
+		}
+		total += int64(tinfo.OnDiskSize)
+	}
+
+	tableInfos := pstore.Tables()
+	glog.V(2).Infof("Calculating tablet sizes. Found %d tables\n", len(tableInfos))
+	for _, tinfo := range tableInfos {
+		left, err := x.Parse(tinfo.Left)
+		if err != nil {
+			glog.V(3).Infof("Unable to parse key: %v", err)
+			continue
+		}
+		right, err := x.Parse(tinfo.Right)
+		if err != nil {
+			glog.V(3).Infof("Unable to parse key: %v", err)
+			continue
+		}
+
+		// Count the table only if it is occupied by a single predicate.
+		if left.Attr == right.Attr {
+			updateSize(tinfo)
+		} else {
+			glog.V(3).Info("Skipping table not owned by one predicate")
+		}
+	}
+
+	if len(tablets) == 0 {
+		glog.V(2).Infof("No tablets found.")
+		return
+	}
+	// Update Zero with the tablet sizes. If Zero sees a tablet which does not belong to
+	// this group, it would send instruction to delete that tablet. There's an edge case
+	// here if the followers are still running Rollup, and happen to read a key before and
+	// write after the tablet deletion, causing that tablet key to resurface. Then, only the
+	// follower would have that key, not the leader.
+	// However, if the follower then becomes the leader, we'd be able to get rid of that
+	// key then. Alternatively, we could look into cancelling the Rollup if we see a
+	// predicate deletion.
+	if err := groups().doSendMembership(tablets); err != nil {
+		glog.Warningf("While sending membership to Zero. Error: %v", err)
+	} else {
+		glog.V(2).Infof("Sent tablet size update to Zero. Total size: %s",
+			humanize.Bytes(uint64(total)))
+	}
 }
 
 var errNoConnection = errors.New("No connection exists")
@@ -1172,7 +1903,7 @@ func (n *node) abortOldTransactions() {
 	glog.Infof("Found %d old transactions. Acting to abort them.\n", len(starts))
 	req := &pb.TxnTimestamps{Ts: starts}
 	err := n.blockingAbort(req)
-	glog.Infof("Done abortOldTransactions for %d txns. Error: %+v\n", len(req.Ts), err)
+	glog.Infof("Done abortOldTransactions for %d txns. Error: %v\n", len(req.Ts), err)
 }
 
 // calculateSnapshot would calculate a snapshot index, considering these factors:
@@ -1203,10 +1934,11 @@ func (n *node) abortOldTransactions() {
 // This function also takes a startIdx, which can be used an optimization to skip over Raft entries.
 // This is useful when we already have a previous snapshot checkpoint (all txns have concluded up
 // until that last checkpoint) that we can use as a new start point for the snapshot calculation.
-func (n *node) calculateSnapshot(startIdx uint64, discardN int) (*pb.Snapshot, error) {
+func (n *node) calculateSnapshot(startIdx, lastIdx, minPendingStart uint64) (*pb.Snapshot, error) {
 	_, span := otrace.StartSpan(n.ctx, "Calculate.Snapshot",
 		otrace.WithSampler(otrace.AlwaysSample()))
 	defer span.End()
+	discardN := 1
 
 	// We do not need to block snapshot calculation because of a pending stream. Badger would have
 	// pending iterators which would ensure that the data above their read ts would not be
@@ -1239,43 +1971,30 @@ func (n *node) calculateSnapshot(startIdx uint64, discardN int) (*pb.Snapshot, e
 	}
 	span.Annotatef(nil, "Last snapshot: %+v", snap)
 
-	last := n.Applied.DoneUntil()
-	if int(last-first) < discardN {
+	if int(lastIdx-first) < discardN {
 		span.Annotate(nil, "Skipping due to insufficient entries")
 		return nil, nil
 	}
-	span.Annotatef(nil, "Found Raft entries: %d", last-first)
+	span.Annotatef(nil, "Found Raft entries: %d", lastIdx-first)
 
 	if num := posting.Oracle().NumPendingTxns(); num > 0 {
 		glog.V(2).Infof("Num pending txns: %d", num)
 	}
 
-	// We can't rely upon the Raft entries to determine the minPendingStart,
-	// because there are many cases during mutations where we don't commit or
-	// abort the transaction. This might happen due to an early error thrown.
-	// Only the mutations which make it to Zero for a commit/abort decision have
-	// corresponding Delta entries. So, instead of replicating all that logic
-	// here, we just use the MinPendingStartTs tracked by the Oracle, and look
-	// for that in the logs.
-	//
-	// So, we iterate over logs. If we hit MinPendingStartTs, that generates our
-	// snapshotIdx. In any case, we continue picking up txn updates, to generate
-	// a maxCommitTs, which would become the readTs for the snapshot.
-	minPendingStart := posting.Oracle().MinPendingStartTs()
 	maxCommitTs := snap.ReadTs
 	var snapshotIdx uint64
+	var maxAssigned uint64
 
 	// Trying to retrieve all entries at once might cause out-of-memory issues in
 	// cases where the raft log is too big to fit into memory. Instead of retrieving
 	// all entries at once, retrieve it in batches of 64MB.
 	var lastEntry raftpb.Entry
-	for batchFirst := first; batchFirst <= last; {
-		entries, err := n.Store.Entries(batchFirst, last+1, 64<<20)
+	for batchFirst := first; batchFirst <= lastIdx; {
+		entries, err := n.Store.Entries(batchFirst, lastIdx+1, 256<<20)
 		if err != nil {
 			span.Annotatef(nil, "Error: %v", err)
 			return nil, err
 		}
-
 		// Exit early from the loop if no entries were found.
 		if len(entries) == 0 {
 			break
@@ -1288,21 +2007,27 @@ func (n *node) calculateSnapshot(startIdx uint64, discardN int) (*pb.Snapshot, e
 		batchFirst = lastEntry.Index + 1
 
 		for _, entry := range entries {
-			if entry.Type != raftpb.EntryNormal {
+			if entry.Type != raftpb.EntryNormal || len(entry.Data) == 0 {
 				continue
 			}
-			var proposal pb.Proposal
-			if err := proposal.Unmarshal(entry.Data); err != nil {
-				span.Annotatef(nil, "Error: %v", err)
-				return nil, err
-			}
+			proposal := getProposal(entry)
+
+			// The way this works is, we figured out the Raft's lastIdx and minPendingStart before
+			// calling this function. minPendingStart is calculated by choosing minimum start
+			// timestamp of all the pending transactions. We need to ensure that we leave the
+			// mutations corresponding to this start ts in the Raft log, and not truncate them.
+			// We should however choose all the deltas, even if they occur later in the log, because
+			// they track all the commits we have done.
+			var start uint64
 			if proposal.Mutations != nil {
-				start := proposal.Mutations.StartTs
+				start = proposal.Mutations.StartTs
 				if start >= minPendingStart && snapshotIdx == 0 {
+					// This would only be set once. Note the snapshotIdx == 0 condition.
 					snapshotIdx = entry.Index - 1
 				}
 			}
 			if proposal.Delta != nil {
+				maxAssigned = x.Max(maxAssigned, proposal.Delta.MaxAssigned)
 				for _, txn := range proposal.Delta.GetTxns() {
 					maxCommitTs = x.Max(maxCommitTs, txn.CommitTs)
 				}
@@ -1316,7 +2041,7 @@ func (n *node) calculateSnapshot(startIdx uint64, discardN int) (*pb.Snapshot, e
 	}
 	if snapshotIdx == 0 {
 		// It is possible that there are no pending transactions. In that case,
-		// snapshotIdx would be zero.
+		// snapshotIdx would be zero. Instead, set it to last entry's index.
 		snapshotIdx = lastEntry.Index
 		span.Annotatef(nil, "snapshotIdx is zero. Using last entry's index: %d", snapshotIdx)
 	}
@@ -1334,9 +2059,10 @@ func (n *node) calculateSnapshot(startIdx uint64, discardN int) (*pb.Snapshot, e
 	}
 
 	result := &pb.Snapshot{
-		Context: n.RaftContext,
-		Index:   snapshotIdx,
-		ReadTs:  maxCommitTs,
+		Context:     n.RaftContext,
+		Index:       snapshotIdx,
+		ReadTs:      maxCommitTs,
+		MaxAssigned: maxAssigned,
 	}
 	span.Annotatef(nil, "Got snapshot: %+v", result)
 	return result, nil
@@ -1348,8 +2074,7 @@ func (n *node) joinPeers() error {
 		return err
 	}
 
-	gconn := pl.Get()
-	c := pb.NewRaftClient(gconn)
+	c := pb.NewRaftClient(pl.Get())
 	glog.Infof("Calling JoinCluster via leader: %s", pl.Addr)
 	if _, err := c.JoinCluster(n.ctx, n.RaftContext); err != nil {
 		return errors.Wrapf(err, "error while joining cluster")
@@ -1389,10 +2114,12 @@ func (n *node) retryUntilSuccess(fn func() error, pause time.Duration) {
 
 // InitAndStartNode gets called after having at least one membership sync with the cluster.
 func (n *node) InitAndStartNode() {
+	initProposalKey(n.Id)
 	_, restart, err := n.PastLife()
 	x.Check(err)
 
-	if _, hasPeer := groups().MyPeer(); !restart && hasPeer {
+	_, hasPeer := groups().MyPeer()
+	if !restart && hasPeer {
 		// The node has other peers, it might have crashed after joining the cluster and before
 		// writing a snapshot. Check from leader, if it is part of the cluster. Consider this a
 		// restart if it is part of the cluster, else start a new node.
@@ -1403,6 +2130,10 @@ func (n *node) InitAndStartNode() {
 			glog.Errorf("Error while calling hasPeer: %v. Retrying...\n", err)
 			time.Sleep(time.Second)
 		}
+	}
+
+	if n.RaftContext.IsLearner && !hasPeer {
+		glog.Fatal("Cannot start a learner node without peer alpha nodes")
 	}
 
 	if restart {
@@ -1417,8 +2148,15 @@ func (n *node) InitAndStartNode() {
 			// zero-member Raft group.
 			n.SetConfState(&sp.Metadata.ConfState)
 
+			// TODO: Making connections here seems unnecessary, evaluate.
 			members := groups().members(n.gid)
 			for _, id := range sp.Metadata.ConfState.Nodes {
+				m, ok := members[id]
+				if ok {
+					n.Connect(id, m.Addr)
+				}
+			}
+			for _, id := range sp.Metadata.ConfState.Learners {
 				m, ok := members[id]
 				if ok {
 					n.Connect(id, m.Addr)
@@ -1446,9 +2184,18 @@ func (n *node) InitAndStartNode() {
 			n.canCampaign = true
 		}
 	}
-	go n.processRollups()
+	go n.processTabletSizes()
 	go n.processApplyCh()
 	go n.BatchAndSendMessages()
+	go n.monitorRaftMetrics()
+	go n.cdcTracker.processCDCEvents()
+	// Ignoring the error since InitAndStartNode does not return an error and using x.Check would
+	// not be the right thing to do.
+	_, _ = n.startTask(opRollup)
+	go n.stopAllTasks()
+	for i := 0; i < 8; i++ {
+		go n.mutationWorker(i)
+	}
 	go n.Run()
 }
 
@@ -1458,4 +2205,29 @@ func (n *node) AmLeader() bool {
 	}
 	r := n.Raft()
 	return r.Status().Lead == r.Status().ID
+}
+
+func (n *node) monitorRaftMetrics() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		curPendingSize := atomic.LoadInt64(&n.pendingSize)
+		ostats.Record(n.ctx, x.RaftPendingSize.M(curPendingSize))
+		ostats.Record(n.ctx, x.RaftApplyCh.M(int64(len(n.applyCh))))
+	}
+}
+
+func getSanitizedString(proposal *pb.Proposal) string {
+	ps := proposal.String()
+	if proposal.GetRestore() != nil {
+		if len(proposal.GetRestore().GetAccessKey()) != 0 {
+			ps = strings.Replace(ps, proposal.GetRestore().GetAccessKey(),
+				sensitiveString, 1)
+		}
+		if len(proposal.GetRestore().GetSecretKey()) != 0 {
+			ps = strings.Replace(ps, proposal.GetRestore().GetSecretKey(),
+				sensitiveString, 1)
+		}
+	}
+	return ps
 }
