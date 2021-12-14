@@ -18,6 +18,7 @@ package codec
 
 import (
 	"encoding/binary"
+	"sort"
 
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
@@ -38,14 +39,15 @@ var (
 	bitMask uint64 = 0xffffffff00000000
 )
 
-//TODO(Ahsan): Need to fix this.
-func ApproxLen(bitmap []byte) int {
-	return 0
-}
-
 func ToList(rm *sroar.Bitmap) *pb.List {
 	return &pb.List{
-		Bitmap: ToBytes(rm),
+		Bitmap: rm.ToBufferWithCopy(),
+	}
+}
+
+func ToListNoCopy(rm *sroar.Bitmap) *pb.List {
+	return &pb.List{
+		Bitmap: rm.ToBuffer(),
 	}
 }
 
@@ -62,7 +64,7 @@ func ListCardinality(l *pb.List) uint64 {
 	if len(l.SortedUids) > 0 {
 		return uint64(len(l.SortedUids))
 	}
-	b := FromList(l)
+	b := FromListNoCopy(l)
 	return uint64(b.GetCardinality())
 }
 
@@ -79,7 +81,7 @@ func GetUids(l *pb.List) []uint64 {
 	if len(l.SortedUids) > 0 {
 		return l.SortedUids
 	}
-	return FromList(l).ToArray()
+	return FromListNoCopy(l).ToArray()
 }
 
 func SetUids(l *pb.List, uids []uint64) {
@@ -88,7 +90,7 @@ func SetUids(l *pb.List, uids []uint64) {
 	} else {
 		r := sroar.NewBitmap()
 		r.SetMany(uids)
-		l.Bitmap = ToBytes(r)
+		l.Bitmap = r.ToBuffer()
 	}
 }
 
@@ -98,11 +100,6 @@ func BitmapToSorted(l *pb.List) {
 	}
 	l.SortedUids = FromList(l).ToArray()
 	l.Bitmap = nil
-}
-
-func And(rm *sroar.Bitmap, l *pb.List) {
-	rl := FromList(l)
-	rm.And(rl)
 }
 
 func MatrixToBitmap(matrix []*pb.List) *sroar.Bitmap {
@@ -132,35 +129,51 @@ func Merge(matrix []*pb.List) *sroar.Bitmap {
 	if len(matrix) == 0 {
 		return out
 	}
-	out.Or(FromList(matrix[0]))
-	for _, l := range matrix[1:] {
-		r := FromList(l)
-		out.Or(r)
+
+	var bms []*sroar.Bitmap
+	for _, m := range matrix {
+		if bmc := FromListNoCopy(m); bmc != nil {
+			bms = append(bms, bmc)
+		}
 	}
-	return out
+	return sroar.FastOr(bms...)
 }
 
-func ToBytes(bm *sroar.Bitmap) []byte {
-	if bm.IsEmpty() {
-		return nil
-	}
-	// TODO: We should not use ToBufferWithCopy always.
-	return bm.ToBufferWithCopy()
+func fromSortedSlice(uids []uint64) *sroar.Bitmap {
+	uidsCopy := make([]uint64, len(uids))
+	copy(uidsCopy, uids)
+	sort.Slice(uidsCopy, func(i, j int) bool {
+		return uidsCopy[i] < uidsCopy[j]
+	})
+	return sroar.FromSortedList(uidsCopy)
 }
 
 func FromList(l *pb.List) *sroar.Bitmap {
-	iw := sroar.NewBitmap()
 	if l == nil {
-		return iw
+		return sroar.NewBitmap()
+	}
+	// Keep the check for bitmap before sortedUids because we expect to have bitmap very often
+	if len(l.Bitmap) > 0 {
+		return sroar.FromBufferWithCopy(l.Bitmap)
 	}
 	if len(l.SortedUids) > 0 {
-		iw.SetMany(l.SortedUids)
+		return fromSortedSlice(l.SortedUids)
 	}
+	return sroar.NewBitmap()
+}
+
+func FromListNoCopy(l *pb.List) *sroar.Bitmap {
+	if l == nil {
+		return sroar.NewBitmap()
+	}
+	// Keep the check for bitmap before sortedUids because we expect to have bitmap very often
 	if len(l.Bitmap) > 0 {
-		// TODO: We should not use FromBufferWithCopy always.
-		iw = sroar.FromBufferWithCopy(l.Bitmap)
+		return sroar.FromBuffer(l.Bitmap)
 	}
-	return iw
+	if len(l.SortedUids) > 0 {
+		return fromSortedSlice(l.SortedUids)
+	}
+	return sroar.NewBitmap()
 }
 
 func FromBytes(buf []byte) *sroar.Bitmap {
@@ -172,8 +185,8 @@ func FromBytes(buf []byte) *sroar.Bitmap {
 }
 
 func FromBackup(buf []byte) *sroar.Bitmap {
-	r := sroar.NewBitmap()
 	var prev uint64
+	var uids []uint64
 	for len(buf) > 0 {
 		uid, n := binary.Uvarint(buf)
 		if uid == 0 {
@@ -182,14 +195,14 @@ func FromBackup(buf []byte) *sroar.Bitmap {
 		buf = buf[n:]
 
 		next := prev + uid
-		r.Set(next)
+		uids = append(uids, next)
 		prev = next
 	}
-	return r
+	return sroar.FromSortedList(uids)
 }
 
 func ToUids(plist *pb.PostingList, start uint64) []uint64 {
-	r := sroar.FromBuffer(plist.Bitmap)
+	r := sroar.FromBufferWithCopy(plist.Bitmap)
 	r.RemoveRange(0, start)
 	return r.ToArray()
 }

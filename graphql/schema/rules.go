@@ -47,7 +47,11 @@ func init() {
 	validator.AddRule("Check variable type is correct", variableTypeCheck)
 	validator.AddRule("Check arguments of cascade directive", directiveArgumentsCheck)
 	validator.AddRule("Check range for Int type", intRangeCheck)
-	validator.AddRule("Input Coercion to List", listInputCoercion)
+	// Graphql accept both single object and array of objects as value when the schema is defined
+	// as an array. listInputCoercion changes the value to array if the single object is provided.
+	// Changing the value can mess up with the other data validation rules hence we are setting
+	// up the order to a high value so that it will be executed last.
+	validator.AddRuleWithOrder("Input Coercion to List", 100, listInputCoercion)
 	validator.AddRule("Check filter functions", filterCheck)
 
 }
@@ -1275,7 +1279,7 @@ func lambdaDirectiveValidation(sch *ast.Schema,
 	if x.LambdaUrl(x.GalaxyNamespace) == "" {
 		return []*gqlerror.Error{gqlerror.ErrorPosf(dir.Position,
 			"Type %s; Field %s: has the @lambda directive, but the "+
-				`--graphql "lambda-url=...;" flag wasn't specified during alpha startup.`,
+				`--lambda "url=...;" flag wasn't specified during alpha startup.`,
 			typ.Name, field.Name)}
 	}
 	// reuse @custom directive validation
@@ -1285,6 +1289,88 @@ func lambdaDirectiveValidation(sch *ast.Schema,
 		err.Message = "While building @custom for @lambda: " + err.Message
 	}
 	return errs
+}
+
+func defaultDirectiveValidation(sch *ast.Schema,
+	typ *ast.Definition,
+	field *ast.FieldDefinition,
+	dir *ast.Directive,
+	secrets map[string]x.Sensitive) gqlerror.List {
+	if typ.Directives.ForName(remoteDirective) != nil {
+		return []*gqlerror.Error{gqlerror.ErrorPosf(
+			dir.Position,
+			"Type %s; Field %s: cannot use @default directive on a @remote type",
+			typ.Name, field.Name)}
+	}
+	if !isScalar(field.Type.Name()) && sch.Types[field.Type.Name()].Kind != ast.Enum {
+		return []*gqlerror.Error{gqlerror.ErrorPosf(
+			dir.Position,
+			"Type %s; Field %s: cannot use @default directive on field with non-scalar type %s",
+			typ.Name, field.Name, field.Type.Name())}
+	}
+	if field.Type.Elem != nil {
+		return []*gqlerror.Error{gqlerror.ErrorPosf(
+			dir.Position,
+			"Type %s; Field %s: cannot use @default directive on field with list type [%s]",
+			typ.Name, field.Name, field.Type.Name())}
+	}
+	if field.Directives.ForName(idDirective) != nil {
+		return []*gqlerror.Error{gqlerror.ErrorPosf(
+			dir.Position,
+			"Type %s; Field %s: cannot use @default directive on field with @id directive",
+			typ.Name, field.Name)}
+	}
+	if isID(field) {
+		return []*gqlerror.Error{gqlerror.ErrorPosf(
+			dir.Position,
+			"Type %s; Field %s: cannot use @default directive on field with type ID",
+			typ.Name, field.Name)}
+	}
+	if field.Directives.ForName(customDirective) != nil {
+		return []*gqlerror.Error{gqlerror.ErrorPosf(
+			dir.Position,
+			"Type %s; Field %s: cannot use @default directive on field with @custom directive",
+			typ.Name, field.Name)}
+	}
+	if field.Directives.ForName(lambdaDirective) != nil {
+		return []*gqlerror.Error{gqlerror.ErrorPosf(
+			dir.Position,
+			"Type %s; Field %s: cannot use @default directive on field with @lambda directive",
+			typ.Name, field.Name)}
+	}
+	for _, arg := range dir.Arguments {
+		fieldType := field.Type.Name()
+		value := arg.Value.Children.ForName("value").Raw
+		if value == "$now" && fieldType != "DateTime" {
+			return []*gqlerror.Error{gqlerror.ErrorPosf(
+				dir.Position,
+				"Type %s; Field %s: @default directive provides value \"%s\" which cannot be used with %s",
+				typ.Name, field.Name, value, fieldType)}
+		}
+		if fieldType == "Int" {
+			if _, err := strconv.ParseInt(value, 10, 64); err != nil {
+				return []*gqlerror.Error{gqlerror.ErrorPosf(
+					dir.Position,
+					"Type %s; Field %s: @default directive provides value \"%s\" which cannot be used with %s",
+					typ.Name, field.Name, value, fieldType)}
+			}
+		}
+		if fieldType == "Float" {
+			if _, err := strconv.ParseFloat(value, 64); err != nil {
+				return []*gqlerror.Error{gqlerror.ErrorPosf(
+					dir.Position,
+					"Type %s; Field %s: @default directive provides value \"%s\" which cannot be used with %s",
+					typ.Name, field.Name, value, fieldType)}
+			}
+		}
+		if fieldType == "Boolean" && value != "true" && value != "false" {
+			return []*gqlerror.Error{gqlerror.ErrorPosf(
+				dir.Position,
+				"Type %s; Field %s: @default directive provides value \"%s\" which cannot be used with %s",
+				typ.Name, field.Name, value, fieldType)}
+		}
+	}
+	return nil
 }
 
 func lambdaOnMutateValidation(sch *ast.Schema, typ *ast.Definition) gqlerror.List {
@@ -1299,7 +1385,7 @@ func lambdaOnMutateValidation(sch *ast.Schema, typ *ast.Definition) gqlerror.Lis
 	if x.LambdaUrl(x.GalaxyNamespace) == "" {
 		errs = append(errs, gqlerror.ErrorPosf(dir.Position,
 			"Type %s: has the @lambdaOnMutate directive, but the "+
-				"`--graphql lambda-url` flag wasn't specified during alpha startup.", typ.Name))
+				"`--lambda url` flag wasn't specified during alpha startup.", typ.Name))
 	}
 
 	if typ.Directives.ForName(remoteDirective) != nil {

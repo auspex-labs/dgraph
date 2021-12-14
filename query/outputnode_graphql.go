@@ -21,7 +21,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -746,7 +745,8 @@ func (genc *graphQLEncoder) resolveCustomField(childField gqlSchema.Field,
 	parentNodeHeads []fastJsonNode, wg *sync.WaitGroup) {
 	defer wg.Done() // signal when this goroutine finishes execution
 
-	fconf, err := childField.CustomHTTPConfig()
+	ns, _ := x.ExtractNamespace(genc.ctx)
+	fconf, err := childField.CustomHTTPConfig(ns)
 	if err != nil {
 		genc.errCh <- x.GqlErrorList{childField.GqlErrorf(nil, err.Error())}
 		return
@@ -956,12 +956,13 @@ func (genc *graphQLEncoder) resolveCustomField(childField gqlSchema.Field,
 			genc.errCh <- hardErrs
 			return
 		}
+
 		batchedResult, ok := response.([]interface{})
 		if !ok {
 			genc.errCh <- append(errs, childField.GqlErrorf(nil,
 				"Evaluation of custom field failed because expected result of external"+
 					" BATCH request to be of list type, got: %v for field: %s within type: %s.",
-				reflect.TypeOf(response).Name(), childField.Name(), childField.GetObjectName()))
+				response, childField.Name(), childField.GetObjectName()))
 			return
 		}
 		if len(batchedResult) != len(uniqueParents) {

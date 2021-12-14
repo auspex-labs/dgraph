@@ -17,18 +17,10 @@
 USER_ID         = $(shell id -u)
 BIN             = dgraph
 BUILD          ?= $(shell git rev-parse --short HEAD)
-BUILD_CODENAME  = unnamed
+BUILD_CODENAME  = zion
 BUILD_DATE     ?= $(shell git log -1 --format=%ci)
 BUILD_BRANCH   ?= $(shell git rev-parse --abbrev-ref HEAD)
-
-# Use the next build version on master branch
-# NOTE: this needs to be updated with each new release
-ifeq ($(BUILD_BRANCH),master)
-# Version on master is of the format <next-release-version>-g<commit-id>
-BUILD_VERSION ?= 'v21.07.0-g'$(BUILD)
-else
 BUILD_VERSION ?= $(shell git describe --always --tags)
-endif
 
 GOOS          ?= $(shell go env GOOS)
 # Only build with jemalloc on Linux, mac
@@ -71,10 +63,13 @@ endif
 HAS_JEMALLOC = $(shell test -f /usr/local/lib/libjemalloc.a && echo "jemalloc")
 JEMALLOC_URL = "https://github.com/jemalloc/jemalloc/releases/download/5.2.1/jemalloc-5.2.1.tar.bz2"
 
-.PHONY: all $(BIN)
+# nodejs
+HAS_NODEJS = $(shell command -v node > /dev/null && echo "nodejs")
+
+.PHONY: all $(BIN) jemalloc nodejs
 all: $(BIN)
 
-$(BIN): clean jemalloc
+$(BIN): clean jemalloc nodejs
 	@go build $(BUILD_FLAGS) -o $(BIN)
 
 clean:
@@ -83,7 +78,7 @@ clean:
 uninstall:
 	@go clean -i -x
 
-install: jemalloc
+install: jemalloc nodejs
 	@echo "Commit SHA256: `git rev-parse HEAD`"
 	@echo "Old SHA256:" `sha256sum $(GOPATH)/bin/$(BIN) 2>/dev/null | cut -c-64`
 	@go install $(BUILD_FLAGS)
@@ -106,3 +101,7 @@ jemalloc:
 		fi \
 	fi
 
+nodejs:
+	@if [ -z "$(HAS_NODEJS)" ]; then \
+		echo "Error: NodeJS not installed"; \
+	fi

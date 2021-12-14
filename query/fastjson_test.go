@@ -23,13 +23,13 @@ func subgraphWithSingleResultAndSingleValue(val *pb.TaskValue) *SubGraph {
 		DestMap:   r,
 		uidMatrix: []*pb.List{codec.OneUid(1)},
 		Children: []*SubGraph{
-			&SubGraph{
+			{
 				Attr:      "val",
 				SrcUIDs:   codec.OneUid(1),
-				uidMatrix: []*pb.List{&pb.List{}},
+				uidMatrix: []*pb.List{{}},
 				valueMatrix: []*pb.ValueList{
 					// UID 1
-					&pb.ValueList{
+					{
 						Values: []*pb.TaskValue{val},
 					},
 				},

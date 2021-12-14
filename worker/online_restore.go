@@ -1,13 +1,17 @@
-// +build !oss
-
 /*
- * Copyright 2020 Dgraph Labs, Inc. and Contributors
+ * Copyright 2021 Dgraph Labs, Inc. and Contributors
  *
- * Licensed under the Dgraph Community License (the "License"); you
- * may not use this file except in compliance with the License. You
- * may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *     https://github.com/dgraph-io/dgraph/blob/master/licenses/DCL.txt
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package worker
@@ -22,7 +26,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/golang/glog"
 	"github.com/minio/minio-go/v6/pkg/credentials"
@@ -177,7 +180,7 @@ func ProcessRestoreRequest(ctx context.Context, req *pb.RestoreRequest, wg *sync
 		reqCopy.GroupId = gid
 		wg.Add(1)
 		go func() {
-			errCh <- tryRestoreProposal(ctx, reqCopy)
+			errCh <- proposeRestoreOrSend(ctx, reqCopy)
 		}()
 	}
 
@@ -209,40 +212,6 @@ func proposeRestoreOrSend(ctx context.Context, req *pb.RestoreRequest) error {
 	return err
 }
 
-func retriableRestoreError(err error) bool {
-	switch {
-	case err == conn.ErrNoConnection:
-		// Try to recover from temporary connection issues.
-		return true
-	case strings.Contains(err.Error(), "Raft isn't initialized yet"):
-		// Try to recover if raft has not been initialized.
-		return true
-	case strings.Contains(err.Error(), errRestoreProposal):
-		// Do not try to recover from other errors when sending the proposal.
-		return false
-	default:
-		// Try to recover from other errors (e.g wrong group, waiting for timestamp, etc).
-		return true
-	}
-}
-
-func tryRestoreProposal(ctx context.Context, req *pb.RestoreRequest) error {
-	var err error
-	for i := 0; i < 10; i++ {
-		err = proposeRestoreOrSend(ctx, req)
-		if err == nil {
-			return nil
-		}
-
-		if retriableRestoreError(err) {
-			time.Sleep(time.Second)
-			continue
-		}
-		return err
-	}
-	return err
-}
-
 // Restore implements the Worker interface.
 func (w *grpcWorker) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.Status, error) {
 	var emptyRes pb.Status
@@ -256,6 +225,7 @@ func (w *grpcWorker) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.S
 		return nil, errors.Wrapf(err, "cannot wait for restore ts %d", req.RestoreTs)
 	}
 
+	glog.Infof("Proposing restore request")
 	err := groups().Node.proposeAndWait(ctx, &pb.Proposal{Restore: req})
 	if err != nil {
 		return &emptyRes, errors.Wrapf(err, errRestoreProposal)
@@ -270,16 +240,23 @@ func handleRestoreProposal(ctx context.Context, req *pb.RestoreRequest, pidx uin
 		return errors.Errorf("nil restore request")
 	}
 
-	// Drop all the current data. This also cancels all existing transactions.
-	dropProposal := pb.Proposal{
-		Mutations: &pb.Mutations{
-			GroupId: req.GroupId,
-			StartTs: req.RestoreTs,
-			DropOp:  pb.Mutations_ALL,
-		},
+	if req.IncrementalFrom == 1 {
+		return errors.Errorf("Incremental restore must not include full backup")
 	}
-	if err := groups().Node.applyMutations(ctx, &dropProposal); err != nil {
-		return err
+
+	// Clean up the cluster if it is a full backup restore.
+	if req.IncrementalFrom == 0 {
+		// Drop all the current data. This also cancels all existing transactions.
+		dropProposal := pb.Proposal{
+			Mutations: &pb.Mutations{
+				GroupId: req.GroupId,
+				StartTs: req.RestoreTs,
+				DropOp:  pb.Mutations_ALL,
+			},
+		}
+		if err := groups().Node.applyMutations(ctx, &dropProposal); err != nil {
+			return err
+		}
 	}
 
 	// TODO: after the drop, the tablets for the predicates stored in this group's
@@ -310,13 +287,13 @@ func handleRestoreProposal(ctx context.Context, req *pb.RestoreRequest, pidx uin
 	}
 
 	lastManifest := manifests[0]
-	preds, ok := lastManifest.Groups[req.GroupId]
+	restorePreds, ok := lastManifest.Groups[req.GroupId]
 
 	if !ok {
 		return errors.Errorf("backup manifest does not contain information for group ID %d",
 			req.GroupId)
 	}
-	for _, pred := range preds {
+	for _, pred := range restorePreds {
 		// Force the tablet to be moved to this group, even if it's currently being served
 		// by another group.
 		if tablet, err := groups().ForceTablet(pred); err != nil {
@@ -338,10 +315,54 @@ func handleRestoreProposal(ctx context.Context, req *pb.RestoreRequest, pidx uin
 	}
 	glog.Infof("Backup map phase is complete. Map result is: %+v\n", mapRes)
 
-	// Reduce the map to pstore using stream writer.
 	sw := pstore.NewStreamWriter()
-	if err := sw.Prepare(); err != nil {
-		return errors.Wrapf(err, "while preparing DB")
+	defer sw.Cancel()
+
+	prepareForReduce := func() error {
+		if req.IncrementalFrom == 0 {
+			return sw.Prepare()
+		}
+		// If there is a drop all in between the last restored backup and the incremental backups
+		// then drop everything before restoring incremental backups.
+		if mapRes.shouldDropAll {
+			if err := pstore.DropAll(); err != nil {
+				return errors.Wrap(err, "failed to reduce incremental restore map")
+			}
+		}
+
+		dropAttrs := [][]byte{x.SchemaPrefix(), x.TypePrefix()}
+		for ns := range mapRes.dropNs {
+			prefix := x.DataPrefix(ns)
+			dropAttrs = append(dropAttrs, prefix)
+		}
+		for attr := range mapRes.dropAttr {
+			dropAttrs = append(dropAttrs, x.PredicatePrefix(attr))
+		}
+
+		// Any predicate which is currently in the state but not in the latest manifest should
+		// be dropped. It is possible that the tablet would have been moved in between the last
+		// restored backup and the incremental backups being restored.
+		clusterPreds := schema.State().Predicates()
+		validPreds := make(map[string]struct{})
+		for _, pred := range restorePreds {
+			validPreds[pred] = struct{}{}
+		}
+		for _, pred := range clusterPreds {
+			if _, ok := validPreds[pred]; !ok {
+				dropAttrs = append(dropAttrs, x.PredicatePrefix(pred))
+			}
+		}
+		if err := pstore.DropPrefixBlocking(dropAttrs...); err != nil {
+			return errors.Wrap(err, "failed to reduce incremental restore map")
+		}
+		if err := sw.PrepareIncremental(); err != nil {
+			return errors.Wrapf(err, "while preparing DB")
+		}
+		return nil
+	}
+
+	if err := prepareForReduce(); err != nil {
+		return errors.Wrap(err, "while preparing for reduce phase")
 	}
 	if err := RunReducer(sw, mapDir); err != nil {
 		return errors.Wrap(err, "failed to reduce restore map")
@@ -360,17 +381,27 @@ func handleRestoreProposal(ctx context.Context, req *pb.RestoreRequest, pidx uin
 		return errors.Wrapf(err, "cannot load schema after restore")
 	}
 
+	// Reset gql schema only when the restore is not partial, so that after this restore the cluster
+	// can be in non-draining mode and hence gqlSchema can be lazy loaded.
+	if !req.IsPartial {
+		glog.Info("reseting local gql schema and script store")
+		ResetGQLSchemaStore()
+		ResetLambdaScriptStore()
+	}
+
 	// Propose a snapshot immediately after all the work is done to prevent the restore
 	// from being replayed.
 	go func(idx uint64) {
 		n := groups().Node
 		if !n.AmLeader() {
+			glog.Infof("I am not leader, not proposing snapshot.")
 			return
 		}
 		if err := n.Applied.WaitForMark(context.Background(), idx); err != nil {
 			glog.Errorf("Error waiting for mark for index %d: %+v", idx, err)
 			return
 		}
+		glog.Infof("I am the leader. Proposing snapshot after restore.")
 		if err := n.proposeSnapshot(); err != nil {
 			glog.Errorf("cannot propose snapshot after processing restore proposal %+v", err)
 		}
@@ -483,10 +514,6 @@ func RunOfflineRestore(dir, location, backupId string, keyFile string,
 		}
 	}
 
-	mapDir, err := ioutil.TempDir(x.WorkerConfig.TmpDir, "restore-map")
-	x.Check(err)
-	defer os.RemoveAll(mapDir)
-
 	for gid := range manifest.Groups {
 		req := &pb.RestoreRequest{
 			Location:          location,
@@ -495,6 +522,12 @@ func RunOfflineRestore(dir, location, backupId string, keyFile string,
 			EncryptionKeyFile: keyFile,
 			RestoreTs:         1,
 		}
+		mapDir, err := ioutil.TempDir(x.WorkerConfig.TmpDir, "restore-map")
+		if err != nil {
+			return LoadResult{Err: errors.Wrapf(err, "Failed to create temp map directory")}
+		}
+		defer os.RemoveAll(mapDir)
+
 		if _, err := RunMapper(req, mapDir); err != nil {
 			return LoadResult{Err: errors.Wrap(err, "RunRestore failed to map")}
 		}
@@ -507,7 +540,8 @@ func RunOfflineRestore(dir, location, backupId string, keyFile string,
 			WithIndexCacheSize(100 * (1 << 20)).
 			WithNumVersionsToKeep(math.MaxInt32).
 			WithEncryptionKey(key).
-			WithNamespaceOffset(x.NamespaceOffset))
+			WithNamespaceOffset(x.NamespaceOffset).
+			WithExternalMagic(x.MagicVersion))
 		if err != nil {
 			return LoadResult{Err: errors.Wrap(err, "RunRestore failed to open DB")}
 		}

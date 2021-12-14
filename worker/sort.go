@@ -329,7 +329,9 @@ BUCKETS:
 
 		// Apply the offset on null nodes, if the nodes with value were not enough.
 		if out[i].offset < len(nullNodes) {
-			nullNodes = nullNodes[out[i].offset:]
+			if out[i].offset >= 0 {
+				nullNodes = nullNodes[out[i].offset:]
+			}
 		} else {
 			nullNodes = nullNodes[:0]
 		}
@@ -413,7 +415,8 @@ func multiSort(ctx context.Context, r *sortresult, ts *pb.SortMessage) error {
 		dsz := int(dest.GetCardinality())
 		x.AssertTrue(len(result.ValueMatrix) == dsz)
 		itr := dest.NewIterator()
-		for i := 0; itr.HasNext(); i++ {
+		uid := itr.Next()
+		for i := 0; uid > 0; i++ {
 			var sv types.Val
 			if len(result.ValueMatrix[i].Values) == 0 {
 				// Assign nil value which is sorted as greater than all other values.
@@ -428,8 +431,8 @@ func multiSort(ctx context.Context, r *sortresult, ts *pb.SortMessage) error {
 					return err
 				}
 			}
-			uid := itr.Next()
 			sortVals[uid][or.idx] = sv
+			uid = itr.Next()
 		}
 	}
 

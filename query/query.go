@@ -804,7 +804,7 @@ func (sg *SubGraph) populate(uids []uint64) error {
 	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
 	r := sroar.NewBitmap()
 	r.SetMany(uids)
-	sg.uidMatrix = []*pb.List{{Bitmap: codec.ToBytes(r)}}
+	sg.uidMatrix = []*pb.List{{Bitmap: r.ToBuffer()}}
 	// User specified list may not be sorted.
 	sg.SrcUIDs = &pb.List{SortedUids: uids}
 	return nil
@@ -1151,9 +1151,10 @@ func (fromNode *varValue) transformTo(toPath []*SubGraph) (map[uint64]types.Val,
 			continue
 		}
 
+		srcUids := codec.GetUids(curNode.SrcUIDs)
 		for i := 0; i < len(curNode.uidMatrix); i++ {
 			ul := curNode.uidMatrix[i]
-			srcUid := codec.GetUids(curNode.SrcUIDs)[i]
+			srcUid := srcUids[i]
 			curVal, ok := newMap[srcUid]
 			if !ok || curVal.Value == nil {
 				continue
@@ -1275,7 +1276,7 @@ func (sg *SubGraph) valueVarAggregation(doneVars map[string]varValue, path []*Su
 			mp := make(map[uint64]types.Val)
 			rangeOver := sg.SrcUIDs
 			if parent == nil {
-				rangeOver = &pb.List{Bitmap: codec.ToBytes(sg.DestMap)}
+				rangeOver = &pb.List{Bitmap: sg.DestMap.ToBuffer()}
 			}
 			if rangeOver == nil {
 				it := doneVars[sg.Params.Var]
@@ -1433,8 +1434,8 @@ func (sg *SubGraph) populateVarMap(doneVars map[string]varValue, sgPath []*SubGr
 	// Filter out UIDs that don't have atleast one UID in every child.
 	itr := sg.DestMap.NewIterator()
 	out := sg.DestMap.Clone()
-	for i := 0; itr.HasNext(); i++ {
-		uid := itr.Next()
+	uid := itr.Next()
+	for i := 0; uid > 0; i++ {
 		var exclude bool
 		for _, child := range sg.Children {
 			// For uid we dont actually populate the uidMatrix or values. So a node asking for
@@ -1458,6 +1459,7 @@ func (sg *SubGraph) populateVarMap(doneVars map[string]varValue, sgPath []*SubGr
 		if exclude {
 			out.Remove(uid)
 		}
+		uid = itr.Next()
 	}
 	// Note the we can't overwrite DestUids, as it'd also modify the SrcUids of
 	// next level and the mapping from SrcUids to uidMatrix would be lost.
@@ -1775,8 +1777,7 @@ func (sg *SubGraph) fillVars(mp map[string]varValue) error {
 		case (v.Typ == gql.UidVar && sg.SrcFunc != nil && sg.SrcFunc.Name == "uid_in"):
 			srcFuncArgs := sg.SrcFunc.Args[:0]
 			itr := l.UidMap.NewIterator()
-			for itr.HasNext() {
-				uid := itr.Next()
+			for uid := itr.Next(); uid > 0; uid = itr.Next() {
 				// We use base 10 here because the uid parser expects the uid to be in base 10.
 				arg := gql.Arg{Value: strconv.FormatUint(uid, 10)}
 				srcFuncArgs = append(srcFuncArgs, arg)
@@ -2140,7 +2141,8 @@ func ProcessGraph(ctx context.Context, sg, parent *SubGraph, rch chan error) {
 				rch <- err
 				return
 			}
-			codec.And(sg.DestMap, sg.SrcUIDs)
+			srcBm := codec.FromListNoCopy(sg.SrcUIDs)
+			sg.DestMap.And(srcBm)
 			rch <- nil
 			return
 		}
@@ -2246,6 +2248,10 @@ func ProcessGraph(ctx context.Context, sg, parent *SubGraph, rch chan error) {
 			}
 
 			filter.SrcUIDs = codec.ToList(sg.DestMap)
+			if codec.ListCardinality(filter.SrcUIDs) == 0 {
+				filterChan <- nil
+				continue
+			}
 			// Passing the pointer is okay since the filter only reads.
 			filter.Params.ParentVars = sg.Params.ParentVars // Pass to the child.
 			go ProcessGraph(ctx, filter, sg, filterChan)
@@ -2465,7 +2471,7 @@ func (sg *SubGraph) applyRandom(ctx context.Context) error {
 
 		r := sroar.NewBitmap()
 		r.SetMany(uidList[:numRandom])
-		sg.uidMatrix[i].Bitmap = codec.ToBytes(r)
+		sg.uidMatrix[i].Bitmap = r.ToBuffer()
 	}
 
 	sg.DestMap = codec.Merge(sg.uidMatrix)
@@ -2486,7 +2492,7 @@ func (sg *SubGraph) applyPagination(ctx context.Context) error {
 		start, end := x.PageRange(sg.Params.Count, sg.Params.Offset, len(uids))
 		r := sroar.NewBitmap()
 		r.SetMany(uids[start:end])
-		sg.uidMatrix[i].Bitmap = codec.ToBytes(r)
+		sg.uidMatrix[i].Bitmap = r.ToBuffer()
 	}
 	// Re-merge the UID matrix.
 	sg.DestMap = codec.Merge(sg.uidMatrix)

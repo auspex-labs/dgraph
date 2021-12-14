@@ -39,10 +39,10 @@ import (
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/dgraph-io/sroar"
 	"github.com/golang/glog"
+	"github.com/golang/protobuf/proto"
 	otrace "go.opencensus.io/trace"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/golang/protobuf/proto"
 	cindex "github.com/google/codesearch/index"
 	cregexp "github.com/google/codesearch/regexp"
 	"github.com/pkg/errors"
@@ -381,30 +381,11 @@ func (qs *queryState) handleValuePostings(ctx context.Context, args funcArgs) er
 	outputs := make([]*pb.Result, numGo)
 	listType := schema.State().IsList(q.Attr)
 
-	calculate := func(start int) error {
-		x.AssertTrue(start%width == 0)
+	calculate := func(idx int, itr *sroar.Iterator) error {
 		out := &pb.Result{}
-		outputs[start/width] = out
+		outputs[idx] = out
 
-		startNum, err := bm.Select(uint64(start))
-		x.Check(err)
-
-		itr := bm.NewIterator()
-		itr.AdvanceIfNeeded(startNum)
-
-		for count := 0; itr.HasNext(); count++ {
-			if count >= width {
-				break
-			}
-			if count%100 == 0 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				default:
-				}
-			}
-
-			uid := itr.Next()
+		for uid := itr.Next(); uid > 0; uid = itr.Next() {
 			key := x.DataKey(q.Attr, uid)
 
 			// Get or create the posting list for an entity, attribute combination.
@@ -518,17 +499,18 @@ func (qs *queryState) handleValuePostings(ctx context.Context, args funcArgs) er
 				// Add an empty UID list to make later processing consistent
 				out.UidMatrix = append(out.UidMatrix, &pb.List{})
 			default:
-				out.UidMatrix = append(out.UidMatrix, codec.ToList(res))
+				out.UidMatrix = append(out.UidMatrix, &pb.List{Bitmap: res.ToBuffer()})
 			}
 		}
 		return nil
 	} // End of calculate function.
 
+	iters := bm.NewRangeIterators(numGo)
 	var g errgroup.Group
 	for i := 0; i < numGo; i++ {
-		start := i * width
+		i := i
 		g.Go(func() error {
-			return calculate(start)
+			return calculate(i, iters[i])
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -561,16 +543,18 @@ func facetsFilterValuePostingList(args funcArgs, pl *posting.List, facetsTree *f
 
 	if !pickMultiplePostings {
 		// Retrieve the posting that matches the language preferences.
-		langMatch, err = pl.PostingFor(q.ReadTs, q.Langs)
-		if err != nil && err != posting.ErrNoValue {
-			return err
+		if len(q.Langs) > 0 {
+			langMatch, err = pl.PostingFor(q.ReadTs, q.Langs)
+			if err != nil && err != posting.ErrNoValue {
+				return err
+			}
 		}
 	}
 
 	// TODO(Ashish): This function starts iteration from start(afterUID is always 0). This can be
 	// optimized in come cases. For example when we know lang tag to fetch, we can directly jump
 	// to posting starting with that UID(check list.ValueFor()).
-	return pl.IterateAll(q.ReadTs, 0, func(p *pb.Posting) error {
+	return pl.Iterate(q.ReadTs, 0, func(p *pb.Posting) error {
 		if q.ExpandAll {
 			// If q.ExpandAll is true we need to consider all postings irrespective of langs.
 		} else if listType && len(q.Langs) == 0 {
@@ -579,8 +563,12 @@ func facetsFilterValuePostingList(args funcArgs, pl *posting.List, facetsTree *f
 				return nil
 			}
 		} else {
+			// Don't retrieve tagged values unless explicitly asked.
+			if len(q.Langs) == 0 && len(p.LangTag) > 0 {
+				return nil
+			}
 			// Only consider the posting that matches our language preferences.
-			if !proto.Equal(p, langMatch) {
+			if len(q.Langs) > 0 && !proto.Equal(p, langMatch) {
 				return nil
 			}
 		}
@@ -744,12 +732,14 @@ func (qs *queryState) handleUidPostings(
 	errCh := make(chan error, numGo)
 	outputs := make([]*pb.Result, numGo)
 
+	uids := codec.GetUids(q.UidList)
+	srcFnUidList := &pb.List{Bitmap: srcFn.uidsPresent.ToBuffer()}
+
 	calculate := func(start, end int) error {
 		x.AssertTrue(start%width == 0)
 		out := &pb.Result{}
 		outputs[start/width] = out
 
-		uids := codec.GetUids(q.UidList)
 		for i := start; i < end; i++ {
 			if i%100 == 0 {
 				select {
@@ -820,13 +810,10 @@ func (qs *queryState) handleUidPostings(
 				if i == 0 {
 					span.Annotate(nil, "UidInFn")
 				}
-				reqBm := sroar.NewBitmap()
-				reqBm.SetMany(srcFn.uidsPresent)
-				reqList := codec.ToList(reqBm)
 				topts := posting.ListOptions{
 					ReadTs:    args.q.ReadTs,
 					AfterUid:  0,
-					Intersect: reqList,
+					Intersect: srcFnUidList,
 					First:     int(args.q.First + args.q.Offset),
 				}
 				plist, err := pl.Uids(topts)
@@ -1187,8 +1174,7 @@ func (qs *queryState) handleRegexFunction(ctx context.Context, arg funcArgs) err
 
 	filtered := sroar.NewBitmap()
 	itr := uids.NewIterator()
-	for itr.HasNext() {
-		uid := itr.Next()
+	for uid := itr.Next(); uid > 0; uid = itr.Next() {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1229,7 +1215,7 @@ func (qs *queryState) handleRegexFunction(ctx context.Context, arg funcArgs) err
 	}
 
 	list := &pb.List{
-		Bitmap: codec.ToBytes(filtered),
+		Bitmap: filtered.ToBuffer(),
 	}
 	arg.out.UidMatrix = append(arg.out.UidMatrix, list)
 	return nil
@@ -1435,8 +1421,7 @@ func (qs *queryState) handleMatchFunction(ctx context.Context, arg funcArgs) err
 	filtered := sroar.NewBitmap()
 
 	itr := uids.NewIterator()
-	for itr.HasNext() {
-		uid := itr.Next()
+	for uid := itr.Next(); uid > 0; uid = itr.Next() {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1478,7 +1463,7 @@ func (qs *queryState) handleMatchFunction(ctx context.Context, arg funcArgs) err
 	}
 
 	out := &pb.List{
-		Bitmap: codec.ToBytes(filtered),
+		Bitmap: filtered.ToBuffer(),
 	}
 	arg.out.UidMatrix = append(arg.out.UidMatrix, out)
 	return nil
@@ -1510,20 +1495,12 @@ func (qs *queryState) filterGeoFunction(ctx context.Context, arg funcArgs) error
 	}
 
 	filtered := make([]*sroar.Bitmap, numGo)
-	filter := func(idx, start, end int) error {
+	filter := func(idx int, it *sroar.Iterator) error {
 
 		filtered[idx] = sroar.NewBitmap()
 		out := filtered[idx]
 
-		startUid, err := uids.Select(uint64(start))
-		if err != nil {
-			return err
-		}
-		itr := uids.NewIterator()
-		itr.AdvanceIfNeeded(startUid)
-
-		for uidx := start; uidx < end; uidx++ {
-			uid := itr.Next()
+		for uid := it.Next(); uid > 0; uid = it.Next() {
 			pl, err := qs.cache.Get(x.DataKey(attr, uid))
 			if err != nil {
 				return err
@@ -1545,16 +1522,12 @@ func (qs *queryState) filterGeoFunction(ctx context.Context, arg funcArgs) error
 		return nil
 	}
 
+	iters := uids.NewRangeIterators(numGo)
 	errCh := make(chan error, numGo)
 	for i := 0; i < numGo; i++ {
-		start := i * width
-		end := start + width
-		if end > numUids {
-			end = numUids
-		}
-		go func(idx, start, end int) {
-			errCh <- filter(idx, start, end)
-		}(i, start, end)
+		go func(idx int, it *sroar.Iterator) {
+			errCh <- filter(idx, it)
+		}(i, iters[i])
 	}
 	for i := 0; i < numGo; i++ {
 		if err := <-errCh; err != nil {
@@ -1572,7 +1545,7 @@ func (qs *queryState) filterGeoFunction(ctx context.Context, arg funcArgs) error
 	}
 	for i := 0; i < len(matrix); i++ {
 		matrix[i].And(final)
-		arg.out.UidMatrix[i].Bitmap = codec.ToBytes(matrix[i])
+		arg.out.UidMatrix[i].Bitmap = matrix[i].ToBuffer()
 	}
 	return nil
 }
@@ -1633,8 +1606,7 @@ func (qs *queryState) filterStringFunction(arg funcArgs) error {
 	// We can't directly modify uids bitmap. We need to add them to another bitmap, and then take
 	// the difference.
 	remove := sroar.NewBitmap()
-	for itr.HasNext() {
-		uid := itr.Next()
+	for uid := itr.Next(); uid > 0; uid = itr.Next() {
 		vals, err := qs.getValsForUID(attr, lang, uid, arg.q.ReadTs)
 		switch {
 		case err == posting.ErrNoValue:
@@ -1660,7 +1632,7 @@ func (qs *queryState) filterStringFunction(arg funcArgs) error {
 	uids.AndNot(remove)
 	for i := 0; i < len(matrix); i++ {
 		matrix[i].And(uids)
-		arg.out.UidMatrix[i].Bitmap = codec.ToBytes(matrix[i])
+		arg.out.UidMatrix[i].Bitmap = matrix[i].ToBuffer()
 	}
 	return nil
 }
@@ -1708,7 +1680,7 @@ type functionContext struct {
 	ineqValueToken []string
 	n              int
 	threshold      []int64
-	uidsPresent    []uint64
+	uidsPresent    *sroar.Bitmap
 	fname          string
 	fnType         FuncType
 	regex          *cregexp.Regexp
@@ -1974,6 +1946,7 @@ func parseSrcFn(ctx context.Context, q *pb.Query) (*functionContext, error) {
 		}
 		checkRoot(q, fc)
 	case uidInFn:
+		var uids []uint64
 		for _, arg := range q.SrcFunc.Args {
 			uidParsed, err := strconv.ParseUint(arg, 0, 64)
 			if err != nil {
@@ -1983,11 +1956,12 @@ func parseSrcFn(ctx context.Context, q *pb.Query) (*functionContext, error) {
 				}
 				return nil, err
 			}
-			fc.uidsPresent = append(fc.uidsPresent, uidParsed)
+			uids = append(uids, uidParsed)
 		}
-		sort.Slice(fc.uidsPresent, func(i, j int) bool {
-			return fc.uidsPresent[i] < fc.uidsPresent[j]
+		sort.Slice(uids, func(i, j int) bool {
+			return uids[i] < uids[j]
 		})
+		fc.uidsPresent = sroar.FromSortedList(uids)
 		checkRoot(q, fc)
 		if fc.isFuncAtRoot {
 			return nil, errors.Errorf("uid_in function not allowed at root")
@@ -2445,7 +2419,7 @@ loop:
 			continue
 		}
 		if item.UserMeta()&posting.BitCompletePosting > 0 {
-			// This bit would only be set if there are valid uids in UidPack.
+			// This bit would only be set if there are valid uids in Bitmap.
 			err := checkInclusion(pk.Uid)
 			switch {
 			case err == posting.ErrNoValue:
@@ -2510,7 +2484,7 @@ loop:
 	if span != nil {
 		span.Annotatef(nil, "handleHasFunction found %d uids", setCnt)
 	}
-	result := &pb.List{Bitmap: codec.ToBytes(res)}
+	result := &pb.List{Bitmap: res.ToBuffer()}
 	out.UidMatrix = append(out.UidMatrix, result)
 	return nil
 }

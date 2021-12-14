@@ -24,7 +24,6 @@ import (
 	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v3"
-	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
@@ -72,13 +71,12 @@ type current struct {
 
 type countIndexer struct {
 	*reducer
-	writer      *badger.StreamWriter
-	splitWriter *badger.WriteBatch
-	splitCh     chan *badger.KVList
-	tmpDb       *badger.DB
-	cur         current
-	countBuf    *z.Buffer
-	wg          sync.WaitGroup
+	writer   *badger.StreamWriter
+	splitCh  chan *badger.KVList
+	tmpDb    *badger.DB
+	cur      current
+	countBuf *z.Buffer
+	wg       sync.WaitGroup
 }
 
 // addUid adds the uid from rawKey to a count index if a count index is
@@ -146,7 +144,7 @@ func (c *countIndexer) writeIndex(buf *z.Buffer) {
 			return
 		}
 
-		pl.Bitmap = codec.ToBytes(bm)
+		pl.Bitmap = bm.ToBuffer()
 
 		kv := posting.MarshalPostingList(&pl, nil)
 		kv.Key = append([]byte{}, lastCe.Key()...)

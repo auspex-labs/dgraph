@@ -18,6 +18,7 @@ package zero
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -25,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/dgraph/conn"
@@ -46,6 +48,8 @@ import (
 const (
 	raftDefaults = "idx=1; learner=false;"
 )
+
+var proposalKey uint64
 
 type node struct {
 	*conn.Node
@@ -80,8 +84,19 @@ func (n *node) AmLeader() bool {
 	return time.Since(n.lastQuorum) <= 5*time.Second
 }
 
+// {2 bytes Node ID} {4 bytes for random} {2 bytes zero}
+func (n *node) initProposalKey(id uint64) error {
+	x.AssertTrue(id != 0)
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return err
+	}
+	proposalKey = n.Id<<48 | binary.BigEndian.Uint64(b)<<16
+	return nil
+}
+
 func (n *node) uniqueKey() uint64 {
-	return uint64(n.Id)<<32 | uint64(n.Rand.Uint32())
+	return atomic.AddUint64(&proposalKey, 1)
 }
 
 var errInternalRetry = errors.New("Retry Raft proposal internally")
@@ -283,12 +298,25 @@ func (n *node) regenerateChecksum() {
 	}
 }
 
-func (n *node) handleTabletProposal(tablet *pb.Tablet) error {
+func (n *node) handleBulkTabletProposal(tablets []*pb.Tablet) error {
 	n.server.AssertLock()
-	state := n.server.state
-
 	defer n.regenerateChecksum()
+	for _, tablet := range tablets {
+		if err := n.handleTablet(tablet); err != nil {
+			glog.Warningf("not able to handle tablet %s. Got err: %+v", tablet.GetPredicate(), err)
+		}
+	}
 
+	return nil
+}
+
+// handleTablet will check if the given tablet is served by any group.
+// If not the tablet will be added to the current group predicate list
+//
+// This function doesn't take any locks.
+// It is the calling functions responsibility to manage the concurrency.
+func (n *node) handleTablet(tablet *pb.Tablet) error {
+	state := n.server.state
 	if tablet.GroupId == 0 {
 		return errors.Errorf("Tablet group id is zero: %+v", tablet)
 	}
@@ -322,6 +350,12 @@ func (n *node) handleTabletProposal(tablet *pb.Tablet) error {
 	tablet.Force = false
 	group.Tablets[tablet.Predicate] = tablet
 	return nil
+}
+
+func (n *node) handleTabletProposal(tablet *pb.Tablet) error {
+	n.server.AssertLock()
+	defer n.regenerateChecksum()
+	return n.handleTablet(tablet)
 }
 
 func (n *node) deleteNamespace(delNs uint64) error {
@@ -416,6 +450,15 @@ func (n *node) applyProposal(e raftpb.Entry) (uint64, error) {
 			return key, err
 		}
 	}
+
+	if p.Tablets != nil && len(p.Tablets) > 0 {
+		if err := n.handleBulkTabletProposal(p.Tablets); err != nil {
+			span.Annotatef(nil, "While applying bulk tablet proposal: %v", err)
+			glog.Errorf("While applying bulk tablet proposal: %v", err)
+			return key, err
+		}
+	}
+
 	if p.License != nil {
 		// Check that the number of nodes in the cluster should be less than MaxNodes, otherwise
 		// reject the proposal.
@@ -597,6 +640,7 @@ func (n *node) checkForCIDInEntries() (bool, error) {
 }
 
 func (n *node) initAndStartNode() error {
+	x.Check(n.initProposalKey(n.Id))
 	_, restart, err := n.PastLife()
 	x.Check(err)
 

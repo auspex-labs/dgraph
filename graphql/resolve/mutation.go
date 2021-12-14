@@ -504,6 +504,7 @@ func (mr *dgraphResolver) rewriteAndExecute(
 	// once committed, send async updates to configured webhooks, if any.
 	if mutation.HasLambdaOnMutate() {
 		rootUIDs := mr.mutationRewriter.MutatedRootUIDs(mutation, mutResp.GetUids(), result)
+		// NOTE: This is an async operation. We can't extract logs from webhooks.
 		go sendWebhookEvent(ctx, mutation, txnCtx.CommitTs, rootUIDs)
 	}
 

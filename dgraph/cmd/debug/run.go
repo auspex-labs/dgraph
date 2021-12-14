@@ -621,7 +621,8 @@ func printKeys(db *badger.DB) {
 			}
 			switch item.UserMeta() {
 			// This is rather a default case as one of the 4 bit must be set.
-			case posting.BitCompletePosting, posting.BitEmptyPosting, posting.BitSchemaPosting:
+			case posting.BitCompletePosting, posting.BitEmptyPosting, posting.BitSchemaPosting,
+				posting.BitForbidPosting:
 				sz += item.EstimatedSize()
 				break LOOP
 			case posting.BitDeltaPosting:
@@ -878,6 +879,7 @@ func run() {
 		WithEncryptionKey(opt.key).
 		WithBlockCacheSize(1 << 30).
 		WithIndexCacheSize(1 << 30).
+		WithExternalMagic(x.MagicVersion).
 		WithNamespaceOffset(x.NamespaceOffset) // We don't want to see the banned data.
 
 	x.AssertTruef(len(bopts.Dir) > 0, "No posting or wal dir specified.")

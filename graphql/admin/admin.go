@@ -18,6 +18,7 @@ package admin
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,6 +81,16 @@ const (
 		This is the schema that is being served by Dgraph at /graphql.
 		"""
 		generatedSchema: String!
+	}
+
+	"""
+	Data about the Lambda script served by Dgraph.
+	"""
+	type LambdaScript @dgraph(type: "dgraph.graphql") {
+		"""
+		Input script (base64 encoded)
+		"""
+		script: String! @dgraph(pred: "dgraph.graphql.schema")
 	}
 
 	"""
@@ -208,6 +219,18 @@ const (
 
 	input GQLSchemaPatch {
 		schema: String!
+	}
+
+	type UpdateLambdaScriptPayload {
+		lambdaScript: LambdaScript
+	}
+
+	input UpdateLambdaScriptInput {
+		set: ScriptPatch!
+	}
+
+	input ScriptPatch {
+		script: String!
 	}
 
 	input ExportInput {
@@ -389,14 +412,237 @@ const (
 		response: AssignedIds
 	}
 
+	input BackupInput {
+
+		"""
+		Destination for the backup: e.g. Minio or S3 bucket.
+		"""
+		destination: String!
+
+		"""
+		Access key credential for the destination.
+		"""
+		accessKey: String
+
+		"""
+		Secret key credential for the destination.
+		"""
+		secretKey: String
+
+		"""
+		AWS session token, if required.
+		"""
+		sessionToken: String
+
+		"""
+		Set to true to allow backing up to S3 or Minio bucket that requires no credentials.
+		"""
+		anonymous: Boolean
+
+		"""
+		Force a full backup instead of an incremental backup.
+		"""
+		forceFull: Boolean
+	}
+
+	type BackupPayload {
+		response: Response
+		taskId: String
+	}
+
+	input RestoreInput {
+
+		"""
+		Destination for the backup: e.g. Minio or S3 bucket.
+		"""
+		location: String!
+
+		"""
+		Backup ID of the backup series to restore. This ID is included in the manifest.json file.
+		If missing, it defaults to the latest series.
+		"""
+		backupId: String
+
+		"""
+		Number of the backup within the backup series to be restored. Backups with a greater value
+		will be ignored. If the value is zero or missing, the entire series will be restored.
+		"""
+		backupNum: Int
+
+		"""
+		All the backups with num >= incrementalFrom will be restored.
+		"""
+		incrementalFrom: Int
+
+		"""
+		If isPartial is set to true then the cluster will be kept in draining mode after
+		restore. This makes sure that the db is not corrupted by any mutations or tablet moves in
+		between two restores.
+		"""
+		isPartial: Boolean
+
+		"""
+		Path to the key file needed to decrypt the backup. This file should be accessible
+		by all alphas in the group. The backup will be written using the encryption key
+		with which the cluster was started, which might be different than this key.
+		"""
+		encryptionKeyFile: String
+
+		"""
+		Vault server address where the key is stored. This server must be accessible
+		by all alphas in the group. Default "http://localhost:8200".
+		"""
+		vaultAddr: String
+
+		"""
+		Path to the Vault RoleID file.
+		"""
+		vaultRoleIDFile: String
+
+		"""
+		Path to the Vault SecretID file.
+		"""
+		vaultSecretIDFile: String
+
+		"""
+		Vault kv store path where the key lives. Default "secret/data/dgraph".
+		"""
+		vaultPath: String
+
+		"""
+		Vault kv store field whose value is the key. Default "enc_key".
+		"""
+		vaultField: String
+
+		"""
+		Vault kv store field's format. Must be "base64" or "raw". Default "base64".
+		"""
+		vaultFormat: String
+
+		"""
+		Access key credential for the destination.
+		"""
+		accessKey: String
+
+		"""
+		Secret key credential for the destination.
+		"""
+		secretKey: String
+
+		"""
+		AWS session token, if required.
+		"""
+		sessionToken: String
+
+		"""
+		Set to true to allow backing up to S3 or Minio bucket that requires no credentials.
+		"""
+		anonymous: Boolean
+	}
+
+	type RestorePayload {
+		"""
+		A short string indicating whether the restore operation was successfully scheduled.
+		"""
+		code: String
+
+		"""
+		Includes the error message if the operation failed.
+		"""
+		message: String
+	}
+
+	input ListBackupsInput {
+		"""
+		Destination for the backup: e.g. Minio or S3 bucket.
+		"""
+		location: String!
+
+		"""
+		Access key credential for the destination.
+		"""
+		accessKey: String
+
+		"""
+		Secret key credential for the destination.
+		"""
+		secretKey: String
+
+		"""
+		AWS session token, if required.
+		"""
+		sessionToken: String
+
+		"""
+		Whether the destination doesn't require credentials (e.g. S3 public bucket).
+		"""
+		anonymous: Boolean
+
+	}
+
+	type BackupGroup {
+		"""
+		The ID of the cluster group.
+		"""
+		groupId: UInt64
+
+		"""
+		List of predicates assigned to the group.
+		"""
+		predicates: [String]
+	}
+
+	type Manifest {
+		"""
+		Unique ID for the backup series.
+		"""
+		backupId: String
+
+		"""
+		Number of this backup within the backup series. The full backup always has a value of one.
+		"""
+		backupNum: UInt64
+
+		"""
+		Whether this backup was encrypted.
+		"""
+		encrypted: Boolean
+
+		"""
+		List of groups and the predicates they store in this backup.
+		"""
+		groups: [BackupGroup]
+
+		"""
+		Path to the manifest file.
+		"""
+		path: String
+
+		"""
+		The timestamp at which this backup was taken. The next incremental backup will
+		start from this timestamp.
+		"""
+		since: UInt64
+
+		"""
+		The type of backup, either full or incremental.
+		"""
+		type: String
+	}
+
 	` + adminTypes + `
 
 	type Query {
 		getGQLSchema: GQLSchema
+		getLambdaScript: LambdaScript
 		health: [NodeState]
 		state: MembershipState
 		config: Config
 		task(input: TaskInput!): TaskPayload
+		"""
+		Get the information about the backups at a given location.
+		"""
+		listBackups(input: ListBackupsInput!) : [Manifest]
 		` + adminQueries + `
 	}
 
@@ -407,6 +653,11 @@ const (
 		schema, the types and predicates in the Dgraph schema, and cause indexes to be recomputed.
 		"""
 		updateGQLSchema(input: UpdateGQLSchemaInput!) : UpdateGQLSchemaPayload
+
+		"""
+		Update the lambda script used by lambda resolvers.
+		"""
+		updateLambdaScript(input: UpdateLambdaScriptInput!) : UpdateLambdaScriptPayload
 
 		"""
 		Starts an export of all data in the cluster.  Export format should be 'rdf' (the default
@@ -444,6 +695,16 @@ const (
 		Lease UIDs, Timestamps or Namespace IDs in advance.
 		"""
 		assign(input: AssignInput!): AssignPayload
+
+		"""
+		Start a binary backup.
+		"""
+		backup(input: BackupInput!) : BackupPayload
+
+		"""
+		Start restoring a binary backup.
+		"""
+		restore(input: RestoreInput!) : RestorePayload
 
 		` + adminMutations + `
 	}
@@ -500,11 +761,12 @@ var (
 		resolve.LoggingMWMutation,
 	}
 	adminQueryMWConfig = map[string]resolve.QueryMiddlewares{
-		"health":       minimalAdminQryMWs, // dgraph checks Guardian auth for health
-		"state":        minimalAdminQryMWs, // dgraph checks Guardian auth for state
-		"config":       stdAdminQryMWs,
-		"listBackups":  gogQryMWs,
-		"getGQLSchema": stdAdminQryMWs,
+		"health":          minimalAdminQryMWs, // dgraph checks Guardian auth for health
+		"state":           minimalAdminQryMWs, // dgraph checks Guardian auth for state
+		"config":          gogQryMWs,
+		"listBackups":     gogQryMWs,
+		"getGQLSchema":    stdAdminQryMWs,
+		"getLambdaScript": stdAdminQryMWs,
 		// for queries and mutations related to User/Group, dgraph handles Guardian auth,
 		// so no need to apply GuardianAuth Middleware
 		"queryUser":      minimalAdminQryMWs,
@@ -514,21 +776,22 @@ var (
 		"getGroup":       minimalAdminQryMWs,
 	}
 	adminMutationMWConfig = map[string]resolve.MutationMiddlewares{
-		"backup":            gogMutMWs,
-		"config":            gogMutMWs,
-		"draining":          gogMutMWs,
-		"export":            stdAdminMutMWs, // dgraph handles the export for other namespaces by guardian of galaxy
-		"login":             minimalAdminMutMWs,
-		"restore":           gogMutMWs,
-		"shutdown":          gogMutMWs,
-		"removeNode":        gogMutMWs,
-		"moveTablet":        gogMutMWs,
-		"assign":            gogMutMWs,
-		"enterpriseLicense": gogMutMWs,
-		"updateGQLSchema":   stdAdminMutMWs,
-		"addNamespace":      gogAclMutMWs,
-		"deleteNamespace":   gogAclMutMWs,
-		"resetPassword":     gogAclMutMWs,
+		"backup":             gogMutMWs,
+		"config":             gogMutMWs,
+		"draining":           gogMutMWs,
+		"export":             stdAdminMutMWs, // dgraph handles the export by GoG internally
+		"login":              minimalAdminMutMWs,
+		"restore":            gogMutMWs,
+		"shutdown":           gogMutMWs,
+		"removeNode":         gogMutMWs,
+		"moveTablet":         gogMutMWs,
+		"assign":             gogMutMWs,
+		"enterpriseLicense":  gogMutMWs,
+		"updateGQLSchema":    stdAdminMutMWs,
+		"updateLambdaScript": stdAdminMutMWs,
+		"addNamespace":       gogAclMutMWs,
+		"deleteNamespace":    gogAclMutMWs,
+		"resetPassword":      gogAclMutMWs,
 		// for queries and mutations related to User/Group, dgraph handles Guardian auth,
 		// so no need to apply GuardianAuth Middleware
 		"addUser":     minimalAdminMutMWs,
@@ -582,14 +845,6 @@ func (g *GraphQLHealthStore) updatingSchema() {
 	g.v.Store(GraphQLHealth{Healthy: true, StatusMsg: "updating schema"})
 }
 
-type gqlSchema struct {
-	ID              string `json:"id,omitempty"`
-	Schema          string `json:"schema,omitempty"`
-	Version         uint64
-	GeneratedSchema string
-	loaded          bool // This indicate whether the schema has been loaded into graphql server or not
-}
-
 type adminServer struct {
 	rf       resolve.ResolverFactory
 	resolver *resolve.RequestResolver
@@ -600,8 +855,7 @@ type adminServer struct {
 	// The GraphQL server that's being admin'd
 	gqlServer IServeGraphQL
 
-	schema map[uint64]*gqlSchema
-
+	gqlSchemas *worker.GQLSchemaStore
 	// When the schema changes, we use these to create a new RequestResolver for
 	// the main graphql endpoint (gqlServer) and thus refresh the API.
 	fns               *resolve.ResolverFns
@@ -659,7 +913,7 @@ func newAdminResolver(
 		fns:               fns,
 		withIntrospection: withIntrospection,
 		globalEpoch:       epoch,
-		schema:            make(map[uint64]*gqlSchema),
+		gqlSchemas:        worker.NewGQLSchemaStore(),
 		gqlServer:         defaultGqlServer,
 	}
 	adminServerVar = server // store the admin server in package variable
@@ -695,20 +949,33 @@ func newAdminResolver(
 		}
 		ns, _ := x.ParseNamespaceAttr(pk.Attr)
 
-		newSchema := &gqlSchema{
+		var data x.GQL
+		data.Schema, data.Script = worker.ParseAsSchemaAndScript(pl.Postings[0].Value)
+
+		newSchema := &worker.GqlSchema{
 			ID:      query.UidToHex(pk.Uid),
 			Version: kv.GetVersion(),
-			Schema:  string(pl.Postings[0].Value),
+			Schema:  data.Schema,
+		}
+		newScript := &worker.LambdaScript{
+			ID:     query.UidToHex(pk.Uid),
+			Script: data.Script,
 		}
 
+		var currentScript string
+		if script, ok := worker.Lambda().GetCurrent(ns); ok {
+			currentScript = script.Script
+		}
 		server.mux.RLock()
-		currentSchema, ok := server.schema[ns]
+		currentSchema, ok := server.gqlSchemas.GetCurrent(ns)
 		if ok {
-			schemaChanged := newSchema.Schema == currentSchema.Schema
-			if newSchema.Version <= currentSchema.Version || schemaChanged {
+			schemaNotChanged := newSchema.Schema == currentSchema.Schema
+			scriptNotChanged := newScript.Script == currentScript
+			if newSchema.Version <= currentSchema.Version ||
+				(schemaNotChanged && scriptNotChanged) {
 				glog.Infof("namespace: %d. Skipping GraphQL schema update. "+
 					"newSchema.Version: %d, oldSchema.Version: %d, schemaChanged: %v.",
-					ns, newSchema.Version, currentSchema.Version, schemaChanged)
+					ns, newSchema.Version, currentSchema.Version, !schemaNotChanged)
 				server.mux.RUnlock()
 				return
 			}
@@ -730,19 +997,22 @@ func newAdminResolver(
 
 		server.incrementSchemaUpdateCounter(ns)
 		// if the schema hasn't been loaded yet, then we don't need to load it here
-		currentSchema, ok = server.schema[ns]
-		if !(ok && currentSchema.loaded) {
+		currentSchema, ok = server.gqlSchemas.GetCurrent(ns)
+		if !(ok && currentSchema.Loaded) {
 			// this just set schema in admin server, so that next invalid badger subscription update gets rejected upfront
-			server.schema[ns] = newSchema
+			worker.Lambda().Set(ns, newScript)
+			server.gqlSchemas.Set(ns, newSchema)
 			glog.Infof("namespace: %d. Skipping in-memory GraphQL schema update, "+
 				"it will be lazy-loaded later.", ns)
 			return
 		}
 
 		// update this schema in both admin and graphql server
-		newSchema.loaded = true
-		server.schema[ns] = newSchema
+		newSchema.Loaded = true
+		server.gqlSchemas.Set(ns, newSchema)
 		server.resetSchema(ns, gqlSchema)
+		// Update the lambda script
+		worker.Lambda().Set(ns, newScript)
 
 		glog.Infof("namespace: %d. Successfully updated GraphQL schema. "+
 			"Serving New GraphQL API.", ns)
@@ -755,16 +1025,18 @@ func newAdminResolver(
 
 func newAdminResolverFactory() resolve.ResolverFactory {
 	adminMutationResolvers := map[string]resolve.MutationResolverFunc{
-		"addNamespace":      resolveAddNamespace,
-		"backup":            resolveBackup,
-		"config":            resolveUpdateConfig,
-		"deleteNamespace":   resolveDeleteNamespace,
-		"draining":          resolveDraining,
-		"export":            resolveExport,
-		"login":             resolveLogin,
-		"resetPassword":     resolveResetPassword,
-		"restore":           resolveRestore,
-		"shutdown":          resolveShutdown,
+		"addNamespace":       resolveAddNamespace,
+		"backup":             resolveBackup,
+		"config":             resolveUpdateConfig,
+		"deleteNamespace":    resolveDeleteNamespace,
+		"draining":           resolveDraining,
+		"export":             resolveExport,
+		"login":              resolveLogin,
+		"resetPassword":      resolveResetPassword,
+		"restore":            resolveRestore,
+		"shutdown":           resolveShutdown,
+		"updateLambdaScript": resolveUpdateLambda,
+
 		"removeNode":        resolveRemoveNode,
 		"moveTablet":        resolveMoveTablet,
 		"assign":            resolveAssign,
@@ -788,6 +1060,9 @@ func newAdminResolverFactory() resolve.ResolverFactory {
 		}).
 		WithQueryResolver("task", func(q schema.Query) resolve.QueryResolver {
 			return resolve.QueryResolverFunc(resolveTask)
+		}).
+		WithQueryResolver("getLambdaScript", func(q schema.Query) resolve.QueryResolver {
+			return resolve.QueryResolverFunc(resolveGetLambda)
 		}).
 		WithQueryResolver("getGQLSchema", func(q schema.Query) resolve.QueryResolver {
 			return resolve.QueryResolverFunc(
@@ -815,16 +1090,16 @@ func newAdminResolverFactory() resolve.ResolverFactory {
 	return rf.WithSchemaIntrospection()
 }
 
-func getCurrentGraphQLSchema(namespace uint64) (*gqlSchema, error) {
+func getCurrentGraphQLSchema(namespace uint64) (*worker.GqlSchema, error) {
 	uid, graphQLSchema, err := edgraph.GetGQLSchema(namespace)
 	if err != nil {
 		return nil, err
 	}
 
-	return &gqlSchema{ID: uid, Schema: graphQLSchema}, nil
+	return &worker.GqlSchema{ID: uid, Schema: graphQLSchema}, nil
 }
 
-func generateGQLSchema(sch *gqlSchema, ns uint64) (schema.Schema, error) {
+func generateGQLSchema(sch *worker.GqlSchema, ns uint64) (schema.Schema, error) {
 	schHandler, err := schema.NewHandler(sch.Schema, false)
 	if err != nil {
 		return nil, err
@@ -862,8 +1137,8 @@ func (as *adminServer) initServer() {
 			glog.Errorf("namespace: %d. Error reading GraphQL schema: %s.", x.GalaxyNamespace, err)
 			continue
 		}
-		sch.loaded = true
-		as.schema[x.GalaxyNamespace] = sch
+		sch.Loaded = true
+		as.gqlSchemas.Set(x.GalaxyNamespace, sch)
 		// adding the actual resolvers for updateGQLSchema and getGQLSchema only after server has
 		// current GraphQL schema, if there was any.
 		as.addConnectedAdminResolvers()
@@ -1003,8 +1278,12 @@ func (as *adminServer) resetSchema(ns uint64, gqlSchema schema.Schema) {
 				return resolve.QueryResolverFunc(func(ctx context.Context, query schema.Query) *resolve.Resolved {
 					as.mux.RLock()
 					defer as.mux.RUnlock()
-					sch := as.schema[ns].Schema
-					handler, err := schema.NewHandler(sch, true)
+					sch, ok := as.gqlSchemas.GetCurrent(ns)
+					if !ok {
+						return resolve.EmptyResult(query,
+							fmt.Errorf("error while getting the schema for ns %d", ns))
+					}
+					handler, err := schema.NewHandler(sch.Schema, true)
 					if err != nil {
 						return resolve.EmptyResult(query, err)
 					}
@@ -1030,12 +1309,9 @@ func (as *adminServer) resetSchema(ns uint64, gqlSchema schema.Schema) {
 
 func (as *adminServer) lazyLoadSchema(namespace uint64) error {
 	// if the schema is already in memory, no need to fetch it from disk
-	as.mux.RLock()
-	if currentSchema, ok := as.schema[namespace]; ok && currentSchema.loaded {
-		as.mux.RUnlock()
+	if currentSchema, ok := as.gqlSchemas.GetCurrent(namespace); ok && currentSchema.Loaded {
 		return nil
 	}
-	as.mux.RUnlock()
 
 	// otherwise, fetch the schema from disk
 	sch, err := getCurrentGraphQLSchema(namespace)
@@ -1061,16 +1337,37 @@ func (as *adminServer) lazyLoadSchema(namespace uint64) error {
 
 	as.mux.Lock()
 	defer as.mux.Unlock()
-	sch.loaded = true
-	as.schema[namespace] = sch
+	sch.Loaded = true
+	as.gqlSchemas.Set(namespace, sch)
 	as.resetSchema(namespace, generatedSchema)
 
 	glog.Infof("namespace: %d. Successfully lazy-loaded GraphQL schema.", namespace)
 	return nil
 }
 
+func lazyLoadScript(namespace uint64) error {
+	// If script is already loaded in memory, no need to fetch from disk.
+	if _, ok := worker.Lambda().GetCurrent(namespace); ok {
+		return nil
+	}
+	// Otherwise, fetch it from disk.
+	uid, script, err := edgraph.GetLambdaScript(namespace)
+	if err != nil {
+		glog.Errorf("namespace: %d. Error reading Lambda Script: %s.", namespace, err)
+		return errors.Wrap(err, "failed to lazy-load Lambda Script")
+	}
+	worker.Lambda().Set(namespace, &worker.LambdaScript{
+		ID:     uid,
+		Script: script,
+	})
+	return nil
+}
+
 func LazyLoadSchema(namespace uint64) error {
-	return adminServerVar.lazyLoadSchema(namespace)
+	if err := adminServerVar.lazyLoadSchema(namespace); err != nil {
+		return err
+	}
+	return lazyLoadScript(namespace)
 }
 
 func inputArgError(err error) error {

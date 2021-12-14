@@ -21,7 +21,6 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/dgraph-io/dgraph/algo"
 	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
@@ -137,7 +136,7 @@ func (d *dedup) addValue(attr string, value types.Val, uid uint64) {
 	}
 	r := codec.FromList(cur.elements[strKey].entities)
 	r.Set(uid)
-	cur.elements[strKey].entities.Bitmap = codec.ToBytes(r)
+	cur.elements[strKey].entities.Bitmap = r.ToBuffer()
 }
 
 func aggregateGroup(grp *groupResult, child *SubGraph) (types.Val, error) {
@@ -212,6 +211,7 @@ func (res *groupResults) formGroups(dedupMap dedup, cur *pb.List, groupVal []gro
 func (sg *SubGraph) formResult(ul *pb.List) (*groupResults, error) {
 	var dedupMap dedup
 	res := new(groupResults)
+	ur := codec.FromListNoCopy(ul)
 
 	for _, child := range sg.Children {
 		if !child.Params.IgnoreResult {
@@ -228,12 +228,11 @@ func (sg *SubGraph) formResult(ul *pb.List) (*groupResults, error) {
 			for i := 0; i < len(child.uidMatrix); i++ {
 				srcUid := childUids[i]
 				// Ignore uids which are not part of srcUid.
-				if algo.IndexOf(ul, srcUid) < 0 {
+				if !ur.Contains(srcUid) {
 					continue
 				}
 
-				ul := child.uidMatrix[i]
-				for _, uid := range codec.GetUids(ul) {
+				for _, uid := range codec.GetUids(child.uidMatrix[i]) {
 					dedupMap.addValue(attr, types.Val{Tid: types.UidID, Value: uid}, srcUid)
 				}
 			}
@@ -241,7 +240,7 @@ func (sg *SubGraph) formResult(ul *pb.List) (*groupResults, error) {
 			// It's a value node.
 			for i, v := range child.valueMatrix {
 				srcUid := childUids[i]
-				if len(v.Values) == 0 || algo.IndexOf(ul, srcUid) < 0 {
+				if len(v.Values) == 0 || !ur.Contains(srcUid) {
 					continue
 				}
 				val, err := convertTo(v.Values[0])

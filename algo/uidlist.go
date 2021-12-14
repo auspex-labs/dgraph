@@ -17,8 +17,6 @@
 package algo
 
 import (
-	"sort"
-
 	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/sroar"
@@ -43,19 +41,13 @@ func ApplyFilter(u *pb.List, f func(uint64, int) bool) {
 	} else {
 		b := sroar.NewBitmap()
 		b.SetMany(out)
-		u.Bitmap = codec.ToBytes(b)
+		u.Bitmap = b.ToBuffer()
 	}
 }
 
 // IndexOf performs a binary search on the uids slice and returns the index at
 // which it finds the uid, else returns -1
 func IndexOf(u *pb.List, uid uint64) int {
-	bm := codec.FromList(u)
-	// TODO(Ahsan): We might want bm.Rank()
-	uids := bm.ToArray()
-	i := sort.Search(len(uids), func(i int) bool { return uids[i] >= uid })
-	if i < len(uids) && uids[i] == uid {
-		return i
-	}
-	return -1
+	bm := codec.FromListNoCopy(u)
+	return bm.Rank(uid)
 }

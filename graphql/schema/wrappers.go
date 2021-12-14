@@ -19,12 +19,14 @@ package schema
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dgraph-io/dgraph/graphql/authorization"
 	"github.com/dgraph-io/gqlparser/v2/parser"
@@ -173,7 +175,7 @@ type Field interface {
 	TypeName(dgraphTypes []string) string
 	GetObjectName() string
 	IsAuthQuery() bool
-	CustomHTTPConfig() (*FieldHTTPConfig, error)
+	CustomHTTPConfig(ns uint64) (*FieldHTTPConfig, error)
 	EnumValues() []string
 	ConstructedFor() Type
 	ConstructedForDgraphPredicate() string
@@ -271,6 +273,7 @@ type FieldDefinition interface {
 	IsID() bool
 	IsExternal() bool
 	HasIDDirective() bool
+	GetDefaultValue(action string) interface{}
 	HasInterfaceArg() bool
 	Inverse() FieldDefinition
 	WithMemberType(string) FieldDefinition
@@ -1487,7 +1490,7 @@ func (t *astType) IsInbuiltOrEnumType() bool {
 	return ok || (t.inSchema.schema.Types[t.Name()].Kind == ast.Enum)
 }
 
-func getCustomHTTPConfig(f *field, isQueryOrMutation bool) (*FieldHTTPConfig, error) {
+func getCustomHTTPConfig(f *field, isQueryOrMutation bool, ns uint64) (*FieldHTTPConfig, error) {
 	custom := f.op.inSchema.customDirectives[f.GetObjectName()][f.Name()]
 	httpArg := custom.Arguments.ForName(httpArg)
 	fconf := &FieldHTTPConfig{
@@ -1584,11 +1587,19 @@ func getCustomHTTPConfig(f *field, isQueryOrMutation bool) (*FieldHTTPConfig, er
 		}
 		fconf.Template = SubstituteVarsInBody(fconf.Template, bodyVars)
 	}
+
+	// If we are querying the lambda directive, update the URL using load balancer. Also, set the
+	// Accept-Encoding header to "*", so that no compression happens. Otherwise, http package sets
+	// gzip encoding which adds overhead for communication within the same machine.
+	if f.HasLambdaDirective() {
+		fconf.URL = x.LambdaUrl(ns)
+		fconf.ForwardHeaders.Set("Accept-Encoding", "*")
+	}
 	return fconf, nil
 }
 
-func (f *field) CustomHTTPConfig() (*FieldHTTPConfig, error) {
-	return getCustomHTTPConfig(f, false)
+func (f *field) CustomHTTPConfig(ns uint64) (*FieldHTTPConfig, error) {
+	return getCustomHTTPConfig(f, false, ns)
 }
 
 func (f *field) EnumValues() []string {
@@ -1900,8 +1911,8 @@ func (q *query) GetObjectName() string {
 	return q.field.ObjectDefinition.Name
 }
 
-func (q *query) CustomHTTPConfig() (*FieldHTTPConfig, error) {
-	return getCustomHTTPConfig((*field)(q), true)
+func (q *query) CustomHTTPConfig(ns uint64) (*FieldHTTPConfig, error) {
+	return getCustomHTTPConfig((*field)(q), true, ns)
 }
 
 func (q *query) EnumValues() []string {
@@ -2200,8 +2211,8 @@ func (m *mutation) MutatedType() Type {
 	return m.op.inSchema.mutatedType[m.Name()]
 }
 
-func (m *mutation) CustomHTTPConfig() (*FieldHTTPConfig, error) {
-	return getCustomHTTPConfig((*field)(m), true)
+func (m *mutation) CustomHTTPConfig(ns uint64) (*FieldHTTPConfig, error) {
+	return getCustomHTTPConfig((*field)(m), true, ns)
 }
 
 func (m *mutation) EnumValues() []string {
@@ -2337,6 +2348,36 @@ func (fd *fieldDefinition) IsID() bool {
 	return isID(fd.fieldDef)
 }
 
+func (fd *fieldDefinition) GetDefaultValue(action string) interface{} {
+	if fd.fieldDef == nil {
+		return nil
+	}
+	return getDefaultValue(fd.fieldDef, action)
+}
+
+func getDefaultValue(fd *ast.FieldDefinition, action string) interface{} {
+	dir := fd.Directives.ForName(defaultDirective)
+	if dir == nil {
+		return nil
+	}
+	arg := dir.Arguments.ForName(action)
+	if arg == nil {
+		return nil
+	}
+	value := arg.Value.Children.ForName("value")
+	if value == nil {
+		return nil
+	}
+	if value.Raw == "$now" {
+		if flag.Lookup("test.v") == nil {
+			return time.Now().Format(time.RFC3339)
+		} else {
+			return "2000-01-01T00:00:00.00Z"
+		}
+	}
+	return value.Raw
+}
+
 func (fd *fieldDefinition) HasIDDirective() bool {
 	if fd.fieldDef == nil {
 		return false
@@ -2375,6 +2416,10 @@ func hasInterfaceArg(fd *ast.FieldDefinition) bool {
 
 func isID(fd *ast.FieldDefinition) bool {
 	return fd.Type.Name() == "ID"
+}
+
+func hasDefault(fd *ast.FieldDefinition) bool {
+	return fd.Directives.ForName(defaultDirective) != nil
 }
 
 func (fd *fieldDefinition) Type() Type {
@@ -2744,7 +2789,8 @@ func (t *astType) ImplementingTypes() []Type {
 // satisfy a valid post.
 func (t *astType) EnsureNonNulls(obj map[string]interface{}, exclusion string) error {
 	for _, fld := range t.inSchema.schema.Types[t.Name()].Fields {
-		if fld.Type.NonNull && !isID(fld) && fld.Name != exclusion && t.inSchema.customDirectives[t.Name()][fld.Name] == nil {
+		if fld.Type.NonNull && !isID(fld) && !hasDefault(fld) && fld.Name != exclusion &&
+			t.inSchema.customDirectives[t.Name()][fld.Name] == nil {
 			if val, ok := obj[fld.Name]; !ok || val == nil {
 				return errors.Errorf(
 					"type %s requires a value for field %s, but no value present",

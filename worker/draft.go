@@ -124,20 +124,24 @@ func newKeysWritten() *keysWritten {
 // 9. If multiple mutations happen for the same txn, the sequential mutations are always run
 //    serially by applyCh. This is to avoid edge cases.
 func (kw *keysWritten) StillValid(txn *posting.Txn) bool {
-	if txn.AppliedIndexSeen < kw.rejectBeforeIndex {
+	if atomic.LoadUint64(&txn.AppliedIndexSeen) < kw.rejectBeforeIndex {
 		kw.invalidTxns++
 		return false
 	}
-	if txn.MaxAssignedSeen >= txn.StartTs {
+	if atomic.LoadUint64(&txn.MaxAssignedSeen) >= txn.StartTs {
 		kw.validTxns++
 		return true
 	}
-	for hash := range txn.ReadKeys() {
+
+	c := txn.Cache()
+	c.Lock()
+	defer c.Unlock()
+	for hash := range c.ReadKeys() {
 		// If the commitTs is between (MaxAssignedSeen, StartTs], the txn reads were invalid. If the
 		// commitTs is > StartTs, then it doesn't matter for reads. If the commit ts is <
 		// MaxAssignedSeen, that means our reads are valid.
 		commitTs := kw.keyCommitTs[hash]
-		if commitTs > txn.MaxAssignedSeen && commitTs <= txn.StartTs {
+		if commitTs > atomic.LoadUint64(&txn.MaxAssignedSeen) && commitTs <= txn.StartTs {
 			kw.invalidTxns++
 			return false
 		}
@@ -475,12 +479,8 @@ func (n *node) concMutations(ctx context.Context, m *pb.Mutations, txn *posting.
 	}()
 
 	// Update the applied index that we are seeing.
-	if txn.AppliedIndexSeen == 0 {
-		txn.AppliedIndexSeen = n.Applied.DoneUntil()
-	}
-	if txn.MaxAssignedSeen == 0 {
-		txn.MaxAssignedSeen = posting.Oracle().MaxAssigned()
-	}
+	atomic.CompareAndSwapUint64(&txn.AppliedIndexSeen, 0, n.Applied.DoneUntil())
+	atomic.CompareAndSwapUint64(&txn.MaxAssignedSeen, 0, posting.Oracle().MaxAssigned())
 
 	// This txn's Zero assigned start ts could be in the future, because we're
 	// trying to greedily run mutations concurrently as soon as we see them.
@@ -814,13 +814,16 @@ func (n *node) applyCommitted(proposal *pb.Proposal) error {
 			}
 			glog.Warningf("Error while calling CreateSnapshot: %v. Retrying...", err)
 		}
+		atomic.StoreInt64(&lastSnapshotTime, time.Now().Unix())
 		// We can now discard all invalid versions of keys below this ts.
 		pstore.SetDiscardTs(snap.ReadTs)
 		return nil
 	case proposal.Restore != nil:
 		// Enable draining mode for the duration of the restore processing.
 		x.UpdateDrainingMode(true)
-		defer x.UpdateDrainingMode(false)
+		if !proposal.Restore.IsPartial {
+			defer x.UpdateDrainingMode(false)
+		}
 
 		var err error
 		var closer *z.Closer
@@ -830,7 +833,7 @@ func (n *node) applyCommitted(proposal *pb.Proposal) error {
 		}
 		defer closer.Done()
 
-		glog.Infof("Got restore proposal at Index:%d, ReadTs:%d",
+		glog.Infof("Got restore proposal at Index: %d, ReadTs: %d",
 			proposal.Index, proposal.Restore.RestoreTs)
 		if err := handleRestoreProposal(ctx, proposal.Restore, proposal.Index); err != nil {
 			return err
@@ -906,8 +909,10 @@ func (n *node) processApplyCh() {
 		var perr error
 		prev, ok := previous[prop.Key]
 		if ok && prev.err == nil {
-			n.elog.Printf("Proposal with key: %d already applied. Skipping index: %d.\n",
-				prop.Key, prop.Index)
+			msg := fmt.Sprintf("Proposal with key: %d already applied. Skipping index: %d."+
+				" Delta: %+v Snapshot: %+v.\n", prop.Key, prop.Index, prop.Delta, prop.Snapshot)
+			n.elog.Printf(msg)
+			glog.Infof(msg)
 			previous[prop.Key].seen = time.Now() // Update the ts.
 			// Don't break here. We still need to call the Done below.
 
@@ -1073,15 +1078,20 @@ func (n *node) commitOrAbort(_ uint64, delta *pb.OracleDelta) error {
 	var sz int64
 	for _, status := range delta.Txns {
 		txn := posting.Oracle().GetTxn(status.StartTs)
-		if txn == nil {
+		if txn == nil || status.CommitTs == 0 {
 			continue
 		}
-		for k := range txn.Deltas() {
+		c := txn.Cache()
+		c.RLock()
+		for k := range c.Deltas() {
 			n.keysWritten.keyCommitTs[z.MemHashString(k)] = status.CommitTs
 		}
-		n.keysWritten.totalKeys += len(txn.Deltas())
-		numKeys += len(txn.Deltas())
-		if len(txn.Deltas()) == 0 {
+		num := len(c.Deltas())
+		c.RUnlock()
+
+		n.keysWritten.totalKeys += num
+		numKeys += num
+		if num == 0 {
 			continue
 		}
 		txns = append(txns, txn)
@@ -1106,7 +1116,7 @@ func (n *node) commitOrAbort(_ uint64, delta *pb.OracleDelta) error {
 	// This would be used for callback via Badger when skiplist is pushed to
 	// disk.
 	deleteTxns := func() {
-		posting.Oracle().DeleteTxns(delta)
+		posting.Oracle().DeleteTxnsAndRollupKeys(delta)
 	}
 
 	if len(itrs) == 0 {
@@ -1154,9 +1164,10 @@ func (n *node) commitOrAbort(_ uint64, delta *pb.OracleDelta) error {
 	// Clear all the cached lists that were touched by this transaction.
 	for _, status := range delta.Txns {
 		txn := posting.Oracle().GetTxn(status.StartTs)
-		txn.RemoveCachedKeys()
+		if status.CommitTs > 0 {
+			txn.UpdateCachedKeys(status.CommitTs)
+		}
 	}
-	posting.WaitForCache()
 	span.Annotate(nil, "cache keys removed")
 
 	// Now advance Oracle(), so we can service waiting reads.
@@ -1340,6 +1351,8 @@ func (n *node) updateRaftProgress() error {
 	return nil
 }
 
+var lastSnapshotTime int64 = time.Now().Unix()
+
 func (n *node) checkpointAndClose(done chan struct{}) {
 	snapshotAfterEntries := x.WorkerConfig.Raft.GetUint64("snapshot-after-entries")
 	x.AssertTruef(snapshotAfterEntries > 10, "raft.snapshot-after must be a number greater than 10")
@@ -1369,7 +1382,6 @@ func (n *node) checkpointAndClose(done chan struct{}) {
 		return chk-first >= snapshotAfterEntries
 	}
 
-	lastSnapshotTime := time.Now()
 	snapshotFrequency := x.WorkerConfig.Raft.GetDuration("snapshot-after-duration")
 	for {
 		select {
@@ -1409,10 +1421,11 @@ func (n *node) checkpointAndClose(done chan struct{}) {
 				// Note: In case we're exceeding threshold entries, but have not exceeded the
 				// threshold time since last snapshot, calculate would be false.
 				calculate := raft.IsEmptySnap(snap) || n.Store.NumLogFiles() > 4 // #0
+				lastSnapTime := time.Unix(atomic.LoadInt64(&lastSnapshotTime), 0)
 				if snapshotFrequency == 0 {
 					calculate = calculate || exceededSnapshotByEntries() // #1
 
-				} else if time.Since(lastSnapshotTime) > snapshotFrequency {
+				} else if time.Since(lastSnapTime) > snapshotFrequency {
 					// If we haven't taken a snapshot since snapshotFrequency, calculate would
 					// follow snapshot entries.
 					calculate = calculate || exceededSnapshotByEntries() // #2, #3
@@ -1436,7 +1449,7 @@ func (n *node) checkpointAndClose(done chan struct{}) {
 					if err := n.proposeSnapshot(); err != nil {
 						glog.Errorf("While calculating and proposing snapshot: %v", err)
 					} else {
-						lastSnapshotTime = time.Now()
+						atomic.StoreInt64(&lastSnapshotTime, time.Now().Unix())
 					}
 				}
 				go n.abortOldTransactions()
@@ -2032,6 +2045,21 @@ func (n *node) calculateSnapshot(startIdx, lastIdx, minPendingStart uint64) (*pb
 					maxCommitTs = x.Max(maxCommitTs, txn.CommitTs)
 				}
 			}
+
+			// If we encounter a restore proposal, we can immediately truncate the WAL and create
+			// a snapshot. This is to avoid the restore happening again if the server restarts.
+			if proposal.Restore != nil {
+				restoreTs := proposal.Restore.GetRestoreTs()
+				s := &pb.Snapshot{
+					Context:     n.RaftContext,
+					Index:       entry.Index,
+					ReadTs:      restoreTs,
+					MaxAssigned: restoreTs,
+				}
+				span.Annotatef(nil, "Found restore proposal with restoreTs: %d", restoreTs)
+				glog.Infof("calculated snapshot from restore proposal: %+v", s)
+				return s, nil
+			}
 		}
 	}
 
@@ -2114,7 +2142,7 @@ func (n *node) retryUntilSuccess(fn func() error, pause time.Duration) {
 
 // InitAndStartNode gets called after having at least one membership sync with the cluster.
 func (n *node) InitAndStartNode() {
-	initProposalKey(n.Id)
+	x.Check(initProposalKey(n.Id))
 	_, restart, err := n.PastLife()
 	x.Check(err)
 

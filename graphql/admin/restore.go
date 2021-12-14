@@ -22,6 +22,7 @@ import (
 	"sync"
 
 	"github.com/dgraph-io/dgraph/edgraph"
+	"github.com/golang/glog"
 
 	"github.com/dgraph-io/dgraph/graphql/resolve"
 	"github.com/dgraph-io/dgraph/graphql/schema"
@@ -34,6 +35,8 @@ type restoreInput struct {
 	Location          string
 	BackupId          string
 	BackupNum         int
+	IncrementalFrom   int
+	IsPartial         bool
 	EncryptionKeyFile string
 	AccessKey         string
 	SecretKey         string
@@ -52,11 +55,16 @@ func resolveRestore(ctx context.Context, m schema.Mutation) (*resolve.Resolved, 
 	if err != nil {
 		return resolve.EmptyResult(m, err), false
 	}
+	glog.Infof("Got restore request with location: %s, id: %s, num: %d, incrementalFrom: %d,"+
+		"isPartial: %v", input.Location, input.BackupId, input.BackupNum, input.IncrementalFrom,
+		input.IsPartial)
 
 	req := pb.RestoreRequest{
 		Location:          input.Location,
 		BackupId:          input.BackupId,
 		BackupNum:         uint64(input.BackupNum),
+		IncrementalFrom:   uint64(input.IncrementalFrom),
+		IsPartial:         input.IsPartial,
 		EncryptionKeyFile: input.EncryptionKeyFile,
 		AccessKey:         input.AccessKey,
 		SecretKey:         input.SecretKey,
