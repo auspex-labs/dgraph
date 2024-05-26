@@ -32,7 +32,7 @@ function restartCluster {
       -v dgraph_gocache:/root/.cache/go-build \
       -v `pwd`/..:/app \
       -w /app/dgraph \
-      golang:1.19.5 \
+      golang:1.21\
       go build -o /app/osx-docker-gopath/bin/dgraph
   fi
 
