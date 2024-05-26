@@ -21,7 +21,7 @@ require (
 	github.com/dgrijalva/jwt-go/v4 v4.0.0-preview1
 	github.com/dgryski/go-farm v0.0.0-20200201041132-a6ae2369ad13
 	github.com/dgryski/go-groupvarint v0.0.0-20190318181831-5ce5df8ca4e1
-	github.com/docker/docker v1.13.1
+	github.com/docker/docker v24.0.9+incompatible
 	github.com/docker/go-connections v0.4.0
 	github.com/dustin/go-humanize v1.0.0
 	github.com/getsentry/sentry-go v0.6.0
@@ -108,9 +108,12 @@ require (
 	github.com/minio/sha256-simd v0.1.1 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/mitchellh/mapstructure v1.1.2 // indirect
+	github.com/moby/term v0.5.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
+	github.com/morikuni/aec v1.0.0 // indirect
 	github.com/opencontainers/go-digest v1.0.0-rc1 // indirect
+	github.com/opencontainers/image-spec v1.0.1 // indirect
 	github.com/pelletier/go-toml v1.2.0 // indirect
 	github.com/philhofer/fwd v1.0.0 // indirect
 	github.com/pierrec/lz4 v2.6.0+incompatible // indirect
@@ -142,4 +145,5 @@ require (
 	gopkg.in/jcmturner/gokrb5.v7 v7.5.0 // indirect
 	gopkg.in/jcmturner/rpc.v1 v1.1.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
+	gotest.tools/v3 v3.5.1 // indirect
 )
