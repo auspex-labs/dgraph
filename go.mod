@@ -54,12 +54,12 @@ require (
 	go.etcd.io/etcd v0.5.0-alpha.5.0.20190108173120-83c051b701d3
 	go.opencensus.io v0.22.5
 	go.uber.org/zap v1.16.0
-	golang.org/x/crypto v0.9.0
-	golang.org/x/net v0.10.0
+	golang.org/x/crypto v0.21.0
+	golang.org/x/net v0.23.0
 	golang.org/x/sync v0.2.0
-	golang.org/x/sys v0.9.0
-	golang.org/x/term v0.8.0
-	golang.org/x/text v0.9.0
+	golang.org/x/sys v0.18.0
+	golang.org/x/term v0.18.0
+	golang.org/x/text v0.14.0
 	golang.org/x/tools v0.9.3
 	google.golang.org/grpc v1.53.0
 	gopkg.in/square/go-jose.v2 v2.3.1
