@@ -2,7 +2,7 @@ name: Auto-format
 
 on:
     push:
-      branches: [ develop ]
+      branches: [ release/* ]
     pull_request:
       branches: "**"
 
