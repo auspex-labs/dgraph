@@ -1,0 +1,38 @@
+name: Auto-format
+
+on:
+    push:
+      branches: [ develop ]
+    pull_request:
+      branches: "**"
+
+permissions:
+    pull-requests: write
+    contents: write
+
+jobs:
+  auto-format:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 1.21
+
+    - name: Auto format and commit
+      run: |
+        git fetch -q
+        git checkout ${{github.head_ref}} --progress
+        git config --global user.name 'Auspex Automatic'
+        git config --global user.email 'contact@auspex-labs.com'
+        git pull
+        go fmt ./...
+        go mod tidy
+        git add . -v
+        if ! git diff-index --quiet HEAD; then
+          git commit -m "Apply Autoformatting" --allow-empty
+          git push -v
+        fi
